@@ -21,8 +21,8 @@ $(BUILDDIR)/%.o : %.c
 
 .PHONY : clean
 clean :
-	rm -f genelf
-	rm -rf build
+	@rm -f genelf
+	@rm -rf build
 
 .PHONY : tags
 tags :

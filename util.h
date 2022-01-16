@@ -5,16 +5,17 @@
 #define CONCAT(x, y) CONCAT_IMPL(x, y)
 #define ElfN(x) CONCAT(CONCAT(CONCAT(Elf, ELF_WORD_SIZE), _), x)
 #define ELFN(x) CONCAT(CONCAT(CONCAT(ELF, ELF_WORD_SIZE), _), x)
-
-#define elf_addr ElfN(Addr)
-#define elf_ehdr ElfN(Ehdr)
-#define elf_phdr ElfN(Phdr)
-#define elf_shdr ElfN(Shdr)
-#define elf_dyn ElfN(Dyn)
-#define elf_sym ElfN(Sym)
-#define elf_rela ElfN(Rela)
-#define elf_xword ElfN(Xword)
 #define ELF_R_SYM ELFN(R_SYM)
+
+typedef ElfN(Addr) elf_addr;
+typedef ElfN(Ehdr) elf_ehdr;
+typedef ElfN(Phdr) elf_phdr;
+typedef ElfN(Shdr) elf_shdr;
+typedef ElfN(Dyn) elf_dyn;
+typedef ElfN(Sym) elf_sym;
+typedef ElfN(Rela) elf_rela;
+typedef ElfN(Xword) elf_xword;
+typedef ElfN(Off) elf_off;
 
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 

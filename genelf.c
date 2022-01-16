@@ -17,13 +17,23 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <limits.h>
 #include "error.h"
 #include "util.h"
+#include "slist.h"
 
 #define DEFAULT_FILE "elf.bin"
-#define NUM_SECTIONS 11
+#define BUFSIZE 4096
+#define UPDATE_ADDRESS(elf, addr, base)    \
+    do {                                   \
+        if ((elf)->ehdr->e_type == ET_DYN) \
+            (addr) -= (base);              \
+    } while (0)
 
-enum section_index {
+#define GOT_NELEMS(elf) ((elf)->shdr[SH_RELA_PLT].sh_size / sizeof(elf_rela))
+#define GOT_NRESERVED_ELEMS 3
+
+enum section_id {
     SH_NULL,
     SH_INTERP,
     SH_TEXT,
@@ -35,10 +45,11 @@ enum section_index {
     SH_DATA,
     SH_DYNSYM,
     SH_SHSTRTAB,
+    NUM_SECTIONS
 };
 
 struct string_table {
-    enum section_index sidx;
+    enum section_id id;
     char *str;
     unsigned int len;
 };
@@ -68,23 +79,107 @@ struct elf {
     unsigned char *buf;
     unsigned int size;
 
-    /* sections not associated with a segment, e.g. .symtab, .strtab etc. */
+    /* section headers sorted by offset */
+    struct section_list {
+        struct slist head;
+        elf_shdr *shdr;
+        int id;
+    } *section_list;
+
+    /*
+     * Sections not associated with a segment, e.g. .symtab, .strtab etc., and
+     * the section header table.
+     */
     struct section {
         unsigned char *buf;
         unsigned int size;
     } sections;
 };
 
-
 static bool verbose = false;
 static char *output_file = NULL;
 
-static elf_addr get_plt_addr(elf_addr init_addr);
-static unsigned int get_strtbl_size(struct string_table *tbl, unsigned int len);
-static int get_strtbl_idx(struct string_table *tbl, unsigned int len,
-                          enum section_index section);
+static int cmp_offset(const struct slist *p1, const struct slist *p2)
+{
+    return ((struct section_list *) p1)->shdr->sh_offset - ((struct section_list *) p2)->shdr->sh_offset;
+}
 
-static int pid_read(pid_t pid, void *dst, const void *src, size_t len)
+static void insert_section(struct elf *elf, int sid)
+{
+    struct section_list *n;
+
+    n = xcalloc(1, sizeof(*n));
+    n->shdr = &elf->shdr[sid];
+    n->id = sid;
+    slist_add(&elf->section_list->head, (struct slist *) n, cmp_offset);
+}
+
+void section_list_free(struct elf *elf)
+{
+    if (!elf->section_list)
+        return;
+
+    struct slist *head = &elf->section_list->head;
+
+    while (head) {
+        struct section_list *t;
+
+        t = (struct section_list *) head;
+        head = head->next;
+        free(t);
+    }
+}
+
+static int get_section_index(struct elf *elf, int section_id)
+{
+    struct slist *n;
+    int c = 0;
+
+    n = &elf->section_list->head;
+    SLIST_FOREACH(n) {
+        if (((struct section_list *) n)->id == section_id)
+            return c;
+        c++;
+    }
+    return -1;
+}
+
+static unsigned int get_strtbl_size(struct string_table *tbl, unsigned int len)
+{
+    unsigned int size = 0;
+
+    for (int i = 0; i < len; i++)
+        size += tbl[i].len + 1;
+    return size;
+}
+
+static int get_strtbl_idx(struct string_table *tbl, unsigned int len, int sid)
+{
+    int idx = 0;
+
+    for (int i = 0; i < len; i++) {
+        if (i == sid)
+            return idx;
+        idx += tbl[i].len + 1;
+    }
+    return -1;
+}
+
+static elf_addr get_plt_addr(elf_addr init_addr)
+{
+    /*
+     * TODO: search for the first entry
+     *
+     * .PLT0: push  DWORD PTR [ebx + 4]
+     *        jmp   [ebx + 8]
+     *        nop
+     */
+    elf_addr addr = init_addr + 0x1a;
+
+    return addr + (-addr & 0xf); /* align on a 16 byte boundary */
+}
+
+static int mem_read(pid_t pid, void *dst, const void *src, size_t len)
 {
     long word;
     unsigned char *s = (unsigned char *) src;
@@ -116,12 +211,9 @@ static void usage(char *prg)
 }
 
 static void write_file(struct elf *elf)
-
 {
     int fd;
 
-    if (!output_file)
-        output_file = DEFAULT_FILE;
     printf("[+] Writing to file: %s\n", output_file);
     if ((fd = open(output_file, O_WRONLY | O_CREAT | O_TRUNC, 0755)) == -1)
         err_sys("open error");
@@ -135,6 +227,8 @@ void generate_sht(struct elf *elf)
     size_t offset;
     unsigned int sh_strsize = 0;
     unsigned int shstrtab_elems = ARRAY_SIZE(shstrtab);
+    struct slist *n;
+    int c = 0;
 
     offset = elf->shdr[SH_DATA].sh_offset + elf->shdr[SH_DATA].sh_size;
     elf->sections.buf = xmalloc(get_strtbl_size(shstrtab, shstrtab_elems) +
@@ -150,45 +244,120 @@ void generate_sht(struct elf *elf)
         sh_strsize += shstrtab[i].len;
         elf->sections.buf[sh_strsize++] = '\0';
     }
-    elf->shdr[SH_SHSTRTAB].sh_name = get_strtbl_idx(shstrtab, ARRAY_SIZE(shstrtab),
-                                                    SH_SHSTRTAB);
+    elf->shdr[SH_SHSTRTAB].sh_name = get_strtbl_idx(shstrtab, ARRAY_SIZE(shstrtab), SH_SHSTRTAB);
     elf->shdr[SH_SHSTRTAB].sh_type = SHT_STRTAB;
     elf->shdr[SH_SHSTRTAB].sh_flags = 0;
     elf->shdr[SH_SHSTRTAB].sh_addr = 0;
+    elf->shdr[SH_SHSTRTAB].sh_offset = elf->shdr[SH_DATA].sh_offset + elf->shdr[SH_DATA].sh_size;
     elf->shdr[SH_SHSTRTAB].sh_size = sh_strsize;
     elf->shdr[SH_SHSTRTAB].sh_link = SHN_UNDEF;
     elf->shdr[SH_SHSTRTAB].sh_info = 0;
     elf->shdr[SH_SHSTRTAB].sh_addralign = 1;
     elf->shdr[SH_SHSTRTAB].sh_entsize = 0;
-
-    /* update ELF header */
-    elf->ehdr->e_shnum = NUM_SECTIONS;
-    elf->ehdr->e_shstrndx = SH_SHSTRTAB;
-    elf->ehdr->e_shoff = offset;
-    memcpy(elf->buf, elf->ehdr, elf->ehdr->e_ehsize);
+    insert_section(elf, SH_SHSTRTAB);
 
     /* section header table */
     printf("[+] Generating section header table\n");
-    memcpy(elf->sections.buf + sh_strsize, elf->shdr, elf->ehdr->e_shentsize *
-           NUM_SECTIONS);
-    elf->sections.size = sh_strsize + elf->ehdr->e_shentsize * NUM_SECTIONS;
+    elf->sections.size = sh_strsize + elf->ehdr->e_shentsize * slist_size(&elf->section_list->head);
+
+    /* update sh_link and sh_info */
+    elf->shdr[SH_DYNAMIC].sh_link = get_section_index(elf, SH_DYNSTR);
+    elf->shdr[SH_DYNSYM].sh_link = get_section_index(elf, SH_DYNSTR);
+    elf->shdr[SH_RELA_PLT].sh_link = get_section_index(elf, SH_DYNSYM);
+    elf->shdr[SH_RELA_PLT].sh_info = get_section_index(elf, SH_GOT_PLT);
+
+    /* write section header table to buf */
+    n = &elf->section_list->head;
+    SLIST_FOREACH(n) {
+        memcpy(elf->sections.buf + sh_strsize + c * elf->ehdr->e_shentsize,
+               ((struct section_list *) n)->shdr, elf->ehdr->e_shentsize);
+        c++;
+    }
+
+    /* update ELF header */
+    elf->ehdr->e_shnum = slist_size(&elf->section_list->head);
+    elf->ehdr->e_shstrndx = slist_size(&elf->section_list->head) - 1;
+    elf->ehdr->e_shoff = offset;
+    memcpy(elf->buf, elf->ehdr, elf->ehdr->e_ehsize);
 }
 
-static void section_init(struct elf *elf)
+static elf_addr read_process(struct elf *elf, FILE *fp, char *name, pid_t pid)
 {
-    elf->shdr = xmalloc(elf->ehdr->e_shentsize * NUM_SECTIONS);
+    char line[BUFSIZE];
+    char path[PATH_MAX];
+    elf_addr from, to;
+    elf_off offset;
+    unsigned char *buf;
+    elf_ehdr *ehdr;
+    elf_phdr *phdr;
 
-    /* index 0 marks undefined section references */
-    elf->shdr[SH_NULL].sh_name = 0;
-    elf->shdr[SH_NULL].sh_type = SHT_NULL;
-    elf->shdr[SH_NULL].sh_flags = 0;
-    elf->shdr[SH_NULL].sh_addr = 0;
-    elf->shdr[SH_NULL].sh_offset = 0;
-    elf->shdr[SH_NULL].sh_size = 0;
-    elf->shdr[SH_NULL].sh_link = SHN_UNDEF;
-    elf->shdr[SH_NULL].sh_info = 0;
-    elf->shdr[SH_NULL].sh_addralign = 0;
-    elf->shdr[SH_NULL].sh_entsize = 0;
+    offset = 0;
+    while (fgets(line, BUFSIZE, fp)) {
+        if (sscanf(line, "%lx-%lx %*s %*x %*s %*d %s", &from, &to, path) < 3)
+            continue;
+        if (strstr(path, name) != NULL)
+            break;
+    }
+    buf = xmalloc(to - from);
+    if (mem_read(pid, buf, (void *) from, to - from) == -1) {
+        free(buf);
+        return 0;
+    }
+    if (buf[EI_MAG0] != 0x7f || buf[EI_MAG1] != 'E' ||
+        buf[EI_MAG2] != 'L' || buf[EI_MAG3] != 'F') {
+        err_msg("Not an ELF executable\n");
+        free(buf);
+        return 0;
+    }
+    ehdr = (elf_ehdr *) buf;
+    phdr = (elf_phdr *) (buf + ehdr->e_phoff);
+
+    /* get the size of the loadable segments */
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+        if (phdr[i].p_type == PT_LOAD) {
+            if (phdr[i].p_offset > elf->size)
+                elf->size = phdr[i].p_offset;
+            elf->size += phdr[i].p_filesz;
+        }
+    }
+
+    /* read the loadable segments */
+    elf->buf = xmalloc(elf->size);
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+        if (phdr[i].p_type == PT_LOAD) {
+            if (phdr[i].p_offset > offset)
+                offset = phdr[i].p_offset;
+            if (mem_read(pid, elf->buf + offset, (void *) (from + phdr[i].p_vaddr),
+                         phdr[i].p_filesz) == -1) {
+                free(buf);
+                return 0;
+            }
+        }
+    }
+    free(buf);
+    return from;
+}
+
+char *get_procname(pid_t pid)
+{
+    char cmdline[PATH_MAX];
+    char buf[BUFSIZE];
+    FILE *fp;
+    char *p;
+
+    snprintf(cmdline, PATH_MAX, "/proc/%d/cmdline", pid);
+    if ((fp = fopen(cmdline, "r")) == NULL)
+        return NULL;
+    if (fgets(buf, BUFSIZE, fp) == NULL) {
+        fclose(fp);
+        return NULL;
+    }
+    fclose(fp);
+    if ((p = strrchr(buf, '/')) != NULL)
+        p++;
+    else
+        p = buf;
+    return strdup(p);
 }
 
 static void read_dynamic_segment(struct elf *elf, elf_addr base)
@@ -197,24 +366,22 @@ static void read_dynamic_segment(struct elf *elf, elf_addr base)
         switch (elf->dyn[i].d_tag) {
         case DT_PLTGOT: /* .got.plt section */
             elf->shdr[SH_GOT_PLT].sh_offset = elf->dyn[i].d_un.d_ptr - base;
-            if (elf->ehdr->e_type == ET_DYN)
-                elf->dyn[i].d_un.d_ptr -= base;
+            UPDATE_ADDRESS(elf, elf->dyn[i].d_un.d_ptr, base);
             elf->shdr[SH_GOT_PLT].sh_name = get_strtbl_idx(shstrtab, ARRAY_SIZE(shstrtab),
                                                            SH_GOT_PLT);
             elf->shdr[SH_GOT_PLT].sh_type = SHT_PROGBITS;
             elf->shdr[SH_GOT_PLT].sh_flags = SHF_WRITE | SHF_ALLOC;
             elf->shdr[SH_GOT_PLT].sh_addr = elf->dyn[i].d_un.d_ptr;
-            elf->shdr[SH_GOT_PLT].sh_size = 0; // ??
             elf->shdr[SH_GOT_PLT].sh_link = SHN_UNDEF;
             elf->shdr[SH_GOT_PLT].sh_info = 0;
-            elf->shdr[SH_GOT_PLT].sh_addralign = 0; // ??
+            elf->shdr[SH_GOT_PLT].sh_addralign = sizeof(elf_addr);
             elf->shdr[SH_GOT_PLT].sh_entsize = 0;
+            insert_section(elf, SH_GOT_PLT);
             break;
         case DT_STRTAB: /* .dynstr section */
             elf->shdr[SH_DYNSTR].sh_offset = elf->dyn[i].d_un.d_ptr - base;
             elf->dynstr = elf->buf + elf->dyn[i].d_un.d_ptr - base;
-            if (elf->ehdr->e_type == ET_DYN)
-                elf->dyn[i].d_un.d_ptr -= base;
+            UPDATE_ADDRESS(elf, elf->dyn[i].d_un.d_ptr, base);
             elf->shdr[SH_DYNSTR].sh_name = get_strtbl_idx(shstrtab, ARRAY_SIZE(shstrtab),
                                                           SH_DYNSTR);
             elf->shdr[SH_DYNSTR].sh_type = SHT_STRTAB;
@@ -224,6 +391,7 @@ static void read_dynamic_segment(struct elf *elf, elf_addr base)
             elf->shdr[SH_DYNSTR].sh_info = 0;
             elf->shdr[SH_DYNSTR].sh_addralign = 8;
             elf->shdr[SH_DYNSTR].sh_entsize = 0;
+            insert_section(elf, SH_DYNSTR);
             break;
         case DT_STRSZ: /* size of the .dynstr section */
             elf->shdr[SH_DYNSTR].sh_size = elf->dyn[i].d_un.d_val;
@@ -231,38 +399,32 @@ static void read_dynamic_segment(struct elf *elf, elf_addr base)
         case DT_SYMTAB: /* .dynsym section */
             elf->shdr[SH_DYNSYM].sh_offset = elf->dyn[i].d_un.d_ptr - base;
             elf->sym = (elf_sym *) (elf->buf + elf->dyn[i].d_un.d_ptr - base);
-            if (elf->ehdr->e_type == ET_DYN)
-                elf->dyn[i].d_un.d_ptr -= base;
+            UPDATE_ADDRESS(elf, elf->dyn[i].d_un.d_ptr, base);
             elf->shdr[SH_DYNSYM].sh_name = get_strtbl_idx(shstrtab, ARRAY_SIZE(shstrtab),
                                                           SH_DYNSYM);
             elf->shdr[SH_DYNSYM].sh_type = SHT_DYNSYM;
             elf->shdr[SH_DYNSYM].sh_flags = SHF_ALLOC;
             elf->shdr[SH_DYNSYM].sh_addr = elf->dyn[i].d_un.d_ptr;
             elf->shdr[SH_DYNSYM].sh_size = 0; // ??
-            elf->shdr[SH_DYNSYM].sh_link = SH_DYNSTR;
             elf->shdr[SH_DYNSYM].sh_info = 0; // ??
             elf->shdr[SH_DYNSYM].sh_addralign = 8;
+            insert_section(elf, SH_DYNSYM);
             break;
         case DT_SYMENT:
             elf->shdr[SH_DYNSYM].sh_entsize = elf->dyn[i].d_un.d_val;
             break;
         case DT_JMPREL: /* .rela.plt section */
             elf->shdr[SH_RELA_PLT].sh_offset = elf->dyn[i].d_un.d_ptr - base;
-            if (elf->ehdr->e_type == ET_DYN) {
-                elf->dyn[i].d_un.d_ptr -= base;
-                elf->rela = (elf_rela *) (elf->buf + elf->dyn[i].d_un.d_ptr);
-            } else {
-                elf->rela = (elf_rela *) (elf->buf + elf->dyn[i].d_un.d_ptr - base);
-            }
+            elf->rela = (elf_rela *) (elf->buf + elf->dyn[i].d_un.d_ptr - base);
+            UPDATE_ADDRESS(elf, elf->dyn[i].d_un.d_ptr, base);
             elf->shdr[SH_RELA_PLT].sh_name = get_strtbl_idx(shstrtab, ARRAY_SIZE(shstrtab),
                                                           SH_RELA_PLT);
             elf->shdr[SH_RELA_PLT].sh_type = SHT_RELA;
             elf->shdr[SH_RELA_PLT].sh_flags = SHF_ALLOC;
             elf->shdr[SH_RELA_PLT].sh_addr = elf->dyn[i].d_un.d_ptr;
-            elf->shdr[SH_RELA_PLT].sh_link = SH_DYNSYM;
-            elf->shdr[SH_RELA_PLT].sh_info = SH_GOT_PLT;
             elf->shdr[SH_RELA_PLT].sh_addralign = 8;
             elf->shdr[SH_RELA_PLT].sh_entsize = 0x18; // Same as .dynsym?
+            insert_section(elf, SH_RELA_PLT);
             break;
         case DT_PLTRELSZ: /* size of the .rela.plt section */
             elf->shdr[SH_RELA_PLT].sh_size = elf->dyn[i].d_un.d_val;
@@ -279,13 +441,13 @@ static void read_dynamic_segment(struct elf *elf, elf_addr base)
             elf->shdr[SH_INIT].sh_info = 0;
             elf->shdr[SH_INIT].sh_addralign = 4;
             elf->shdr[SH_INIT].sh_entsize = 0;
+            insert_section(elf, SH_INIT);
             break;
-        case DT_RELA:
+        case DT_RELA: /* TODO: add support for more sections */
         case DT_REL:
         case DT_GNU_HASH:
         case DT_VERSYM:
-            if (elf->ehdr->e_type == ET_DYN)
-                elf->dyn[i].d_un.d_ptr -= base;
+            UPDATE_ADDRESS(elf, elf->dyn[i].d_un.d_ptr, base);
             break;
         default:
             break;
@@ -293,89 +455,70 @@ static void read_dynamic_segment(struct elf *elf, elf_addr base)
     }
 }
 
-static bool read_segments(struct elf *elf, pid_t pid, elf_addr base)
-{
-    elf_xword offset = 0;
-
-    printf("[+] Reading segments\n");
-
-    /* get the size of the loadable segments */
-    for (int i = 0; i < elf->ehdr->e_phnum; i++) {
-        if (elf->phdr[i].p_type == PT_LOAD) {
-            if (elf->phdr[i].p_offset > elf->size)
-                elf->size = elf->phdr[i].p_offset;
-            elf->size += elf->phdr[i].p_filesz;
-        }
-    }
-    elf->buf = xcalloc(1, elf->size);
-    for (int i = 0; i < elf->ehdr->e_phnum; i++) {
-        if (elf->phdr[i].p_type == PT_LOAD) {
-            if (elf->phdr[i].p_offset > offset)
-                offset = elf->phdr[i].p_offset;
-            if (pid_read(pid, elf->buf + offset, (void *) (base + elf->phdr[i].p_vaddr),
-                          elf->phdr[i].p_filesz) == -1)
-                return false;
-        }
-    }
-    return true;
-}
-
-static void patch_got(struct elf *elf)
+static void patch_got(struct elf *elf, elf_addr base)
 {
     elf_addr plt_addr;
-    uint64_t plt_entry;
-    uint64_t got_entry;
+    elf_addr plt_entry;
+    elf_addr got_entry;
+
+    /*
+     * Set the size of .got.plt based on the size of the .rela.plt relocation table,
+     * which holds information to relocate entries in the .got.plt section.
+     */
+    elf->shdr[SH_GOT_PLT].sh_size = (GOT_NELEMS(elf) + GOT_NRESERVED_ELEMS) * sizeof(elf_addr);
+
+    /* set the offset based on the data offset and the address of the GOT entry */
+    elf->shdr[SH_GOT_PLT].sh_offset = elf->shdr[SH_DATA].sh_offset + elf->rela[0].r_offset -
+        elf->shdr[SH_DATA].sh_addr - GOT_NRESERVED_ELEMS * sizeof(elf_addr);
 
     plt_addr = get_plt_addr(elf->shdr[SH_INIT].sh_addr);
 
     /* clear GOT[1] and GOT[2] */
     memset(elf->buf + elf->shdr[SH_DATA].sh_offset + elf->shdr[SH_GOT_PLT].sh_addr +
-           8 - elf->shdr[SH_DATA].sh_addr, 0, sizeof(uint64_t));
+           8 - elf->shdr[SH_DATA].sh_addr, 0, sizeof(elf_addr));
     memset(elf->buf + elf->shdr[SH_DATA].sh_offset + elf->shdr[SH_GOT_PLT].sh_addr +
-           16 - elf->shdr[SH_DATA].sh_addr, 0, sizeof(uint64_t));
+           16 - elf->shdr[SH_DATA].sh_addr, 0, sizeof(elf_addr));
 
     /* r_offset contains the virtual address for the specific GOT entries */
-    for (int i = 0; i < elf->shdr[SH_RELA_PLT].sh_size / sizeof(elf_rela); i++) {
+    for (int i = 0; i < GOT_NELEMS(elf); i++) {
         int sym_idx = ELF_R_SYM(elf->rela[i].r_info); /* symbol table index */
 
         /* 6 is the size of the first instruction in PLT[n] (jmp   [ebx + name1@GOT]) */
         /* 16 is the size of a PLT entry */
         plt_entry = plt_addr + (i + 1) * 16 + 6;
-        got_entry = *((uint64_t *) (elf->buf + elf->shdr[SH_DATA].sh_offset +
+        got_entry = *((elf_addr *) (elf->buf + elf->shdr[SH_DATA].sh_offset +
                                     elf->rela[i].r_offset - elf->shdr[SH_DATA].sh_addr));
+        UPDATE_ADDRESS(elf, got_entry, base);
         if (plt_entry != got_entry) {
             memcpy(elf->buf + elf->shdr[SH_DATA].sh_offset + elf->rela[i].r_offset -
-                   elf->shdr[SH_DATA].sh_addr, &plt_entry, sizeof(uint64_t));
+                   elf->shdr[SH_DATA].sh_addr, &plt_entry, sizeof(elf_addr));
             printf("[+] Patching got[%d]:\n", i + 3);
             printf("    0x%lx\t0x%lx\t0x%lx\t%s\n",
                    elf->rela[i].r_offset, /* address of GOT entry */
                    elf->rela[i].r_info, /* symbol table index and type of relocation */
-                   *((uint64_t *) (elf->buf + elf->shdr[SH_DATA].sh_offset +
+                   *((elf_addr *) (elf->buf + elf->shdr[SH_DATA].sh_offset +
                                    elf->rela[i].r_offset - elf->shdr[SH_DATA].sh_addr)),
                    elf->dynstr + elf->sym[sym_idx].st_name); /* name in the string table */
+        } else if (elf->ehdr->e_type == ET_DYN) {
+            /* update got to the relative address for pies */
+            memcpy(elf->buf + elf->shdr[SH_DATA].sh_offset + elf->rela[i].r_offset -
+                   elf->shdr[SH_DATA].sh_addr, &got_entry, sizeof(elf_addr));
         }
     }
 }
 
-static void parse_elf(struct elf *elf, pid_t pid, unsigned char *buf,
-                      uint64_t offset, size_t len)
+static bool parse_elf(struct elf *elf, pid_t pid, elf_addr base)
 {
-    if (buf[EI_MAG0] != 0x7f || buf[EI_MAG1] != 'E' ||
-        buf[EI_MAG2] != 'L' || buf[EI_MAG3] != 'F')
-        err_quit("Not an ELF executable\n");
-    elf->ehdr = (elf_ehdr *) buf;
-    elf->phdr = (elf_phdr *) (buf + elf->ehdr->e_phoff);
-    if (!read_segments(elf, pid, elf->ehdr->e_type == ET_EXEC ? 0 : offset)) {
-        free(buf);
-        free(elf->buf);
-        err_quit("Error reading segments");
-    }
-    free(buf);
     elf->ehdr = (elf_ehdr *) elf->buf;
     elf->phdr = (elf_phdr *) (elf->buf + elf->ehdr->e_phoff);
-    section_init(elf);
-    if (elf->ehdr->e_type != ET_EXEC && elf->ehdr->e_type != ET_DYN)
-        err_quit("ELF type not supported: %d", elf->ehdr->e_type);
+    elf->shdr = xcalloc(NUM_SECTIONS, sizeof(*elf->shdr));
+    elf->section_list = calloc(1, sizeof(*elf->section_list));
+    elf->section_list->shdr = &elf->shdr[SH_NULL];
+    elf->section_list->id = SH_NULL;
+    if (elf->ehdr->e_type != ET_EXEC && elf->ehdr->e_type != ET_DYN) {
+        fprintf(stderr, "ELF type not supported: %d", elf->ehdr->e_type);
+        return false;
+    }
     for (int i = 0; i < elf->ehdr->e_phnum; i++) {
         switch (elf->phdr[i].p_type) {
         case PT_LOAD:
@@ -383,8 +526,7 @@ static void parse_elf(struct elf *elf, pid_t pid, unsigned char *buf,
                 printf("    Data segment: 0x%lx - 0x%lx (off: %lu, size: %lu bytes)\n",
                        elf->phdr[i].p_vaddr, elf->phdr[i].p_vaddr + elf->phdr[i].p_filesz,
                        elf->phdr[i].p_offset, elf->phdr[i].p_filesz);
-                elf->shdr[SH_DATA].sh_name = get_strtbl_idx(shstrtab, ARRAY_SIZE(shstrtab),
-                                                            SH_DATA);
+                elf->shdr[SH_DATA].sh_name = get_strtbl_idx(shstrtab, ARRAY_SIZE(shstrtab), SH_DATA);
                 elf->shdr[SH_DATA].sh_type = SHT_PROGBITS;
                 elf->shdr[SH_DATA].sh_flags = SHF_WRITE | SHF_ALLOC;
                 elf->shdr[SH_DATA].sh_addr = elf->phdr[i].p_vaddr;
@@ -394,12 +536,12 @@ static void parse_elf(struct elf *elf, pid_t pid, unsigned char *buf,
                 elf->shdr[SH_DATA].sh_info = 0;
                 elf->shdr[SH_DATA].sh_addralign = elf->phdr[i].p_align;
                 elf->shdr[SH_DATA].sh_entsize = 0;
+                insert_section(elf, SH_DATA);
             } else if (elf->phdr[i].p_offset && elf->phdr[i].p_flags == (PF_R | PF_X)) {
                 printf("    Text segment: 0x%lx - 0x%lx (off: %lu, size: %lu bytes)\n",
                        elf->phdr[i].p_vaddr, elf->phdr[i].p_vaddr + elf->phdr[i].p_filesz,
                        elf->phdr[i].p_offset, elf->phdr[i].p_filesz);
-                elf->shdr[SH_TEXT].sh_name = get_strtbl_idx(shstrtab, ARRAY_SIZE(shstrtab),
-                                                            SH_TEXT);
+                elf->shdr[SH_TEXT].sh_name = get_strtbl_idx(shstrtab, ARRAY_SIZE(shstrtab), SH_TEXT);
                 elf->shdr[SH_TEXT].sh_type = SHT_PROGBITS;
                 elf->shdr[SH_TEXT].sh_flags = SHF_EXECINSTR | SHF_ALLOC;
                 elf->shdr[SH_TEXT].sh_addr = elf->phdr[i].p_vaddr;
@@ -409,11 +551,11 @@ static void parse_elf(struct elf *elf, pid_t pid, unsigned char *buf,
                 elf->shdr[SH_TEXT].sh_info = 0;
                 elf->shdr[SH_TEXT].sh_addralign = elf->phdr[i].p_align;
                 elf->shdr[SH_TEXT].sh_entsize = 0;
+                insert_section(elf, SH_TEXT);
             }
             break;
         case PT_INTERP:
-            elf->shdr[SH_INTERP].sh_name = get_strtbl_idx(shstrtab, ARRAY_SIZE(shstrtab),
-                                                          SH_INTERP);
+            elf->shdr[SH_INTERP].sh_name = get_strtbl_idx(shstrtab, ARRAY_SIZE(shstrtab), SH_INTERP);
             elf->shdr[SH_INTERP].sh_type = SHT_PROGBITS;
             elf->shdr[SH_INTERP].sh_flags = SHF_ALLOC;
             elf->shdr[SH_INTERP].sh_addr = elf->phdr[i].p_vaddr;
@@ -423,46 +565,47 @@ static void parse_elf(struct elf *elf, pid_t pid, unsigned char *buf,
             elf->shdr[SH_INTERP].sh_info = 0;
             elf->shdr[SH_INTERP].sh_addralign = elf->phdr[i].p_align;
             elf->shdr[SH_INTERP].sh_entsize = 0;
+            insert_section(elf, SH_INTERP);
             break;
         case PT_DYNAMIC:
             printf("    Dynamic segment: 0x%lx - 0x%lx (size: %lu bytes)\n",
                    elf->phdr[i].p_vaddr, elf->phdr[i].p_vaddr + elf->phdr[i].p_memsz,
                    elf->phdr[i].p_memsz);
             elf->dyn = (elf_dyn *) (elf->buf + elf->phdr[i].p_offset);
-            elf->shdr[SH_DYNAMIC].sh_name = get_strtbl_idx(shstrtab, ARRAY_SIZE(shstrtab),
-                                                           SH_DYNAMIC);
+            elf->shdr[SH_DYNAMIC].sh_name = get_strtbl_idx(shstrtab, ARRAY_SIZE(shstrtab), SH_DYNAMIC);
             elf->shdr[SH_DYNAMIC].sh_type = SHT_DYNAMIC;
             /* whether the SHF_WRITE bit is set is processor-specific, check p_flags */
             elf->shdr[SH_DYNAMIC].sh_flags = SHF_ALLOC;
             elf->shdr[SH_DYNAMIC].sh_addr = elf->phdr[i].p_vaddr;
             elf->shdr[SH_DYNAMIC].sh_offset = elf->phdr[i].p_offset;
             elf->shdr[SH_DYNAMIC].sh_size = elf->phdr[i].p_memsz;
-            elf->shdr[SH_DYNAMIC].sh_link = SH_DYNSTR;
             elf->shdr[SH_DYNAMIC].sh_info = 0;
             elf->shdr[SH_DYNAMIC].sh_addralign = elf->phdr[i].p_align;
             elf->shdr[SH_DYNAMIC].sh_entsize = 0;
-            read_dynamic_segment(elf, offset);
+            insert_section(elf, SH_DYNAMIC);
+            read_dynamic_segment(elf, base);
         default:
             break;
         }
     }
-    if (!elf->dyn)
-        err_quit("Cannot find dynamic segment");
+    if (!elf->dyn) {
+        fprintf(stderr, "Cannot find dynamic segment");
+        return false;
+    }
     if (elf->rela)
-        patch_got(elf);
+        patch_got(elf, base);
+    return true;
 }
 
 int main(int argc, char **argv)
 {
     char path[32];
-    uint64_t mem_from;
-    uint64_t mem_to;
-    uint64_t size;
-    pid_t pid = 0;;
+    pid_t pid = 0;
     char *core = NULL;
     int opt;
     struct elf elf;
-    unsigned char *buf;
+    char *procname = NULL;
+    elf_addr base_addr;
 
     while ((opt = getopt(argc, argv, "p:r:hv")) != -1) {
         switch (opt) {
@@ -473,8 +616,7 @@ int main(int argc, char **argv)
             pid = atoi(optarg);
             break;
         case 'r':
-            // TODO: Need to support reading from a core file
-            // core = optarg;
+            core = optarg;
             break;
         case 'v':
             verbose = true;
@@ -486,38 +628,35 @@ int main(int argc, char **argv)
             exit(0);
         }
     }
-    if (argc > optind) {
+    if (argc > optind)
         output_file = argv[optind];
-    }
     if (pid == 0 && !core) {
         usage(argv[0]);
         exit(0);
     }
-    printf("[+] Reading headers\n");
+    memset(&elf, 0, sizeof(elf));
     if (pid != 0) {
         FILE *fp;
 
-        if (snprintf(path, 32, "/proc/%d/maps", pid) < 0)
+        if ((procname = get_procname(pid)) == NULL)
+            err_quit("Error getting process name");
+        if (!output_file)
+            output_file = procname;
+        printf("[+] Reading process\n");
+        if (snprintf(path, 32, "/proc/%d/maps", pid) < 0) {
+            free(procname);
             err_sys("snprintf error");
-
-        /* open /proc/<pid>/maps */
-        if (!(fp = fopen(path, "r")))
+        }
+        if (!(fp = fopen(path, "r"))) {
+            free(procname);
             err_sys("fopen error");
-
+        }
         ptrace(PTRACE_ATTACH, pid, NULL, NULL);
-        waitpid(pid, NULL, 0); /* wait for tracee to stop */
-
-        /* TODO: Need to check if ELF header is merged with text segment */
-        if (fscanf(fp, "%lx-%lx", &mem_from, &mem_to) != 2)
-            err_quit("Cannot read %s", path);
-        size = mem_to - mem_from;
-        buf = xmalloc(size);
-        printf("    ELF header and .rodata: 0x%lx - 0x%lx (size: %lu bytes)\n",
-                mem_from, mem_to, size);
-        if (pid_read(pid, buf, (void * ) mem_from, size) == -1) {
+        waitpid(pid, NULL, 0);
+        if ((base_addr = read_process(&elf, fp, procname, pid)) == 0) {
+            free(procname);
             fclose(fp);
-            free(buf);
-            err_sys("Error reading ELF header");
+            err_quit("Error reading process");
         }
         fclose(fp);
     } else if (core) {
@@ -525,6 +664,8 @@ int main(int argc, char **argv)
         unsigned char *buf;
         struct stat st;
 
+        if (!output_file)
+            output_file = DEFAULT_FILE;
         if ((fd = open(core, O_RDONLY)) == -1) {
             err_sys("open error");
         }
@@ -533,48 +674,21 @@ int main(int argc, char **argv)
         }
         if ((buf = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0)) == MAP_FAILED)
             err_sys("mmap error");
+        close(fd);
     }
-    memset(&elf, 0, sizeof(struct elf));
-    parse_elf(&elf, pid, buf, mem_from, size);
+    if (!parse_elf(&elf, pid, base_addr))
+        goto done;
     generate_sht(&elf);
     write_file(&elf);
-    free(elf.buf);
-    free(elf.sections.buf);
-    free(elf.shdr);
-}
 
-unsigned int get_strtbl_size(struct string_table *tbl, unsigned int len)
-{
-    unsigned int size = 0;
-
-    for (int i = 0; i < len; i++)
-        size += tbl[i].len + 1;
-    return size;
-}
-
-int get_strtbl_idx(struct string_table *tbl, unsigned int len,
-                   enum section_index section)
-{
-    int idx = 0;
-
-    for (int i = 0; i < len; i++) {
-        if (i == section)
-            return idx;
-        idx += tbl[i].len + 1;
-    }
-    return -1;
-}
-
-elf_addr get_plt_addr(uint64_t init_addr)
-{
-    /*
-     * TODO: search for the first entry
-     *
-     * .PLT0: push  DWORD PTR [ebx + 4]
-     *        jmp   [ebx + 8]
-     *        nop
-     */
-    elf_addr addr = init_addr + 0x1a; // 0x18
-
-    return addr + (-addr & 0xf); /* align on a 16 byte boundary */
+done:
+    if (procname)
+        free(procname);
+    if (elf.buf)
+        free(elf.buf);
+    if (elf.sections.buf)
+        free(elf.sections.buf);
+    if (elf.shdr)
+        free(elf.shdr);
+    section_list_free(&elf);
 }
