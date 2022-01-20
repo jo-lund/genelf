@@ -30,6 +30,7 @@
             (addr) -= (base);              \
     } while (0)
 
+#define IS_POWEROF2(x) ((x) > 0 && ((x) & (x - 1)) == 0)
 #define GOT_NELEMS(elf) ((elf)->shdr[SH_RELA_PLT].sh_size / sizeof(elf_rela))
 #define GOT_NRESERVED_ELEMS 3
 
@@ -44,6 +45,8 @@ enum section_id {
     SH_GOT_PLT,
     SH_DATA,
     SH_DYNSYM,
+    SH_HASH,
+    SH_GNU_HASH,
     SH_SHSTRTAB,
     NUM_SECTIONS
 };
@@ -65,6 +68,8 @@ static struct string_table shstrtab[] = {
     { SH_GOT_PLT, ".got.plt", 8 },
     { SH_DATA, ".data", 5 },
     { SH_DYNSYM, ".dynsym", 7 },
+    { SH_HASH, ".hash", 5 },
+    { SH_GNU_HASH, ".gnu.hash", 9 },
     { SH_SHSTRTAB, ".shstrtab", 9 }
 };
 
@@ -78,6 +83,21 @@ struct elf {
     unsigned char *dynstr;
     unsigned char *buf;
     unsigned int size;
+    struct {
+        elf_word nbucket;
+        elf_word nchain;
+        elf_word *bucket; /* hash table buckets array */
+        elf_word *chain;  /* hash table chain array */
+    } hash;
+    struct {
+        elf_word nbucket;
+        elf_word symidx;    /* first accessible symbol in dynsym table */
+        elf_word maskwords; /* bloom filter words */
+        elf_word shift2;    /* bloom filter shift words */
+        elf_addr *bloom;    /* bloom filter */
+        elf_word *buckets;  /* hash table buckets array */
+        elf_word *chain;    /* hash table value array */
+    } gnu_hash;
 
     /* section headers sorted by offset */
     struct section_list {
@@ -96,15 +116,28 @@ struct elf {
     } sections;
 };
 
+static bool valid_hash = false;
+static bool valid_gnu_hash = false;
 static bool verbose = false;
 static char *output_file = NULL;
+
+static void usage(char *prg)
+{
+    printf("Usage: %1$s [-hv] -p pid [output-file] or\n"
+           "       %1$s [-hv] -r core [output-file]\n"
+           "Options:\n"
+           "  -p  Attach to process with process id pid\n"
+           "  -r  Generate ELF executable from core file\n"
+           "  -v  Print verbose output\n"
+           "  -h  Print help message\n", prg);
+}
 
 static int cmp_offset(const struct slist *p1, const struct slist *p2)
 {
     return ((struct section_list *) p1)->shdr->sh_offset - ((struct section_list *) p2)->shdr->sh_offset;
 }
 
-static void insert_section(struct elf *elf, int sid)
+static void section_list_add(struct elf *elf, int sid)
 {
     struct section_list *n;
 
@@ -199,17 +232,6 @@ static int mem_read(pid_t pid, void *dst, const void *src, size_t len)
     return 0;
 }
 
-static void usage(char *prg)
-{
-    printf("Usage: %1$s [-hv] -p pid [output-file] or\n"
-           "       %1$s [-hv] -r core [output-file]\n"
-           "Options:\n"
-           "  -p  Attach to process with process id pid\n"
-           "  -r  Generate ELF executable from core file\n"
-           "  -v  Print verbose output\n"
-           "  -h  Print help message\n", prg);
-}
-
 static void write_file(struct elf *elf)
 {
     int fd;
@@ -254,17 +276,11 @@ void generate_sht(struct elf *elf)
     elf->shdr[SH_SHSTRTAB].sh_info = 0;
     elf->shdr[SH_SHSTRTAB].sh_addralign = 1;
     elf->shdr[SH_SHSTRTAB].sh_entsize = 0;
-    insert_section(elf, SH_SHSTRTAB);
+    section_list_add(elf, SH_SHSTRTAB);
 
     /* section header table */
     printf("[+] Generating section header table\n");
     elf->sections.size = sh_strsize + elf->ehdr->e_shentsize * slist_size(&elf->section_list->head);
-
-    /* update sh_link and sh_info */
-    elf->shdr[SH_DYNAMIC].sh_link = get_section_index(elf, SH_DYNSTR);
-    elf->shdr[SH_DYNSYM].sh_link = get_section_index(elf, SH_DYNSTR);
-    elf->shdr[SH_RELA_PLT].sh_link = get_section_index(elf, SH_DYNSYM);
-    elf->shdr[SH_RELA_PLT].sh_info = get_section_index(elf, SH_GOT_PLT);
 
     /* write section header table to buf */
     n = &elf->section_list->head;
@@ -360,15 +376,53 @@ char *get_procname(pid_t pid)
     return strdup(p);
 }
 
+static int get_nsymbols(struct elf *elf)
+{
+    if (valid_hash)
+        return elf->hash.nchain;
+    if (valid_gnu_hash) {
+        elf_word max;
+        elf_word *hashval;
+
+        max = 0;
+        for (unsigned int i = 0; i < elf->gnu_hash.nbucket; i++) {
+            if (elf->gnu_hash.buckets[i] > max)
+                max = elf->gnu_hash.buckets[i];
+        }
+        hashval = elf->gnu_hash.chain + max;
+        do {
+            max++;
+        } while ((*hashval++ & 1) == 0);
+        return max;
+    }
+    return 0;
+}
+
+static inline int get_hashtab_size(struct elf *elf)
+{
+    return 2 * sizeof(elf_word) + elf->hash.nbucket * sizeof(elf_word) +
+        elf->hash.nchain * sizeof(elf_word);
+}
+
+static inline int get_gnuhashtab_size(struct elf *elf)
+{
+    elf_word bloom_size;
+
+    bloom_size = (ELF_WORD_SIZE / 32) * elf->gnu_hash.maskwords;
+    return 4 * sizeof(elf_word) + bloom_size * sizeof(elf_addr) +
+        elf->gnu_hash.nbucket * sizeof(elf_word);
+}
+
 static void read_dynamic_segment(struct elf *elf, elf_addr base)
 {
+    elf_word *hashtab;
+
     for (int i = 0; elf->dyn[i].d_tag != DT_NULL; i++) {
         switch (elf->dyn[i].d_tag) {
         case DT_PLTGOT: /* .got.plt section */
             elf->shdr[SH_GOT_PLT].sh_offset = elf->dyn[i].d_un.d_ptr - base;
             UPDATE_ADDRESS(elf, elf->dyn[i].d_un.d_ptr, base);
-            elf->shdr[SH_GOT_PLT].sh_name = get_strtbl_idx(shstrtab, ARRAY_SIZE(shstrtab),
-                                                           SH_GOT_PLT);
+            elf->shdr[SH_GOT_PLT].sh_name = get_strtbl_idx(shstrtab, ARRAY_SIZE(shstrtab), SH_GOT_PLT);
             elf->shdr[SH_GOT_PLT].sh_type = SHT_PROGBITS;
             elf->shdr[SH_GOT_PLT].sh_flags = SHF_WRITE | SHF_ALLOC;
             elf->shdr[SH_GOT_PLT].sh_addr = elf->dyn[i].d_un.d_ptr;
@@ -376,14 +430,13 @@ static void read_dynamic_segment(struct elf *elf, elf_addr base)
             elf->shdr[SH_GOT_PLT].sh_info = 0;
             elf->shdr[SH_GOT_PLT].sh_addralign = sizeof(elf_addr);
             elf->shdr[SH_GOT_PLT].sh_entsize = 0;
-            insert_section(elf, SH_GOT_PLT);
+            section_list_add(elf, SH_GOT_PLT);
             break;
         case DT_STRTAB: /* .dynstr section */
             elf->shdr[SH_DYNSTR].sh_offset = elf->dyn[i].d_un.d_ptr - base;
             elf->dynstr = elf->buf + elf->dyn[i].d_un.d_ptr - base;
             UPDATE_ADDRESS(elf, elf->dyn[i].d_un.d_ptr, base);
-            elf->shdr[SH_DYNSTR].sh_name = get_strtbl_idx(shstrtab, ARRAY_SIZE(shstrtab),
-                                                          SH_DYNSTR);
+            elf->shdr[SH_DYNSTR].sh_name = get_strtbl_idx(shstrtab, ARRAY_SIZE(shstrtab), SH_DYNSTR);
             elf->shdr[SH_DYNSTR].sh_type = SHT_STRTAB;
             elf->shdr[SH_DYNSTR].sh_flags = SHF_ALLOC;
             elf->shdr[SH_DYNSTR].sh_addr = elf->dyn[i].d_un.d_ptr;
@@ -391,7 +444,7 @@ static void read_dynamic_segment(struct elf *elf, elf_addr base)
             elf->shdr[SH_DYNSTR].sh_info = 0;
             elf->shdr[SH_DYNSTR].sh_addralign = 8;
             elf->shdr[SH_DYNSTR].sh_entsize = 0;
-            insert_section(elf, SH_DYNSTR);
+            section_list_add(elf, SH_DYNSTR);
             break;
         case DT_STRSZ: /* size of the .dynstr section */
             elf->shdr[SH_DYNSTR].sh_size = elf->dyn[i].d_un.d_val;
@@ -400,15 +453,13 @@ static void read_dynamic_segment(struct elf *elf, elf_addr base)
             elf->shdr[SH_DYNSYM].sh_offset = elf->dyn[i].d_un.d_ptr - base;
             elf->sym = (elf_sym *) (elf->buf + elf->dyn[i].d_un.d_ptr - base);
             UPDATE_ADDRESS(elf, elf->dyn[i].d_un.d_ptr, base);
-            elf->shdr[SH_DYNSYM].sh_name = get_strtbl_idx(shstrtab, ARRAY_SIZE(shstrtab),
-                                                          SH_DYNSYM);
+            elf->shdr[SH_DYNSYM].sh_name = get_strtbl_idx(shstrtab, ARRAY_SIZE(shstrtab), SH_DYNSYM);
             elf->shdr[SH_DYNSYM].sh_type = SHT_DYNSYM;
             elf->shdr[SH_DYNSYM].sh_flags = SHF_ALLOC;
             elf->shdr[SH_DYNSYM].sh_addr = elf->dyn[i].d_un.d_ptr;
-            elf->shdr[SH_DYNSYM].sh_size = 0; // ??
             elf->shdr[SH_DYNSYM].sh_info = 0; // ??
             elf->shdr[SH_DYNSYM].sh_addralign = 8;
-            insert_section(elf, SH_DYNSYM);
+            section_list_add(elf, SH_DYNSYM);
             break;
         case DT_SYMENT:
             elf->shdr[SH_DYNSYM].sh_entsize = elf->dyn[i].d_un.d_val;
@@ -417,21 +468,19 @@ static void read_dynamic_segment(struct elf *elf, elf_addr base)
             elf->shdr[SH_RELA_PLT].sh_offset = elf->dyn[i].d_un.d_ptr - base;
             elf->rela = (elf_rela *) (elf->buf + elf->dyn[i].d_un.d_ptr - base);
             UPDATE_ADDRESS(elf, elf->dyn[i].d_un.d_ptr, base);
-            elf->shdr[SH_RELA_PLT].sh_name = get_strtbl_idx(shstrtab, ARRAY_SIZE(shstrtab),
-                                                          SH_RELA_PLT);
+            elf->shdr[SH_RELA_PLT].sh_name = get_strtbl_idx(shstrtab, ARRAY_SIZE(shstrtab), SH_RELA_PLT);
             elf->shdr[SH_RELA_PLT].sh_type = SHT_RELA;
-            elf->shdr[SH_RELA_PLT].sh_flags = SHF_ALLOC;
+            elf->shdr[SH_RELA_PLT].sh_flags = SHF_ALLOC | SHF_INFO_LINK;
             elf->shdr[SH_RELA_PLT].sh_addr = elf->dyn[i].d_un.d_ptr;
             elf->shdr[SH_RELA_PLT].sh_addralign = 8;
             elf->shdr[SH_RELA_PLT].sh_entsize = 0x18; // Same as .dynsym?
-            insert_section(elf, SH_RELA_PLT);
+            section_list_add(elf, SH_RELA_PLT);
             break;
         case DT_PLTRELSZ: /* size of the .rela.plt section */
             elf->shdr[SH_RELA_PLT].sh_size = elf->dyn[i].d_un.d_val;
             break;
         case DT_INIT: /* .init section */
-            elf->shdr[SH_INIT].sh_name = get_strtbl_idx(shstrtab, ARRAY_SIZE(shstrtab),
-                                                        SH_INIT);
+            elf->shdr[SH_INIT].sh_name = get_strtbl_idx(shstrtab, ARRAY_SIZE(shstrtab), SH_INIT);
             elf->shdr[SH_INIT].sh_type = SHT_PROGBITS;
             elf->shdr[SH_INIT].sh_flags = SHF_EXECINSTR | SHF_ALLOC;
             elf->shdr[SH_INIT].sh_addr = elf->dyn[i].d_un.d_ptr;
@@ -441,11 +490,53 @@ static void read_dynamic_segment(struct elf *elf, elf_addr base)
             elf->shdr[SH_INIT].sh_info = 0;
             elf->shdr[SH_INIT].sh_addralign = 4;
             elf->shdr[SH_INIT].sh_entsize = 0;
-            insert_section(elf, SH_INIT);
+            section_list_add(elf, SH_INIT);
+            break;
+        case DT_HASH:
+            UPDATE_ADDRESS(elf, elf->dyn[i].d_un.d_ptr, base);
+            hashtab = (elf_word *) (elf->buf + elf->dyn[i].d_un.d_ptr);
+            elf->hash.nbucket = hashtab[0];
+            elf->hash.nchain = hashtab[1];
+            elf->hash.bucket = hashtab + 2;
+            elf->hash.chain = elf->hash.bucket + elf->hash.nbucket;
+            valid_hash = elf->hash.nbucket > 0 && elf->hash.nchain > 0 && elf->hash.bucket != NULL;
+            elf->shdr[SH_HASH].sh_name = get_strtbl_idx(shstrtab, ARRAY_SIZE(shstrtab), SH_HASH);
+            elf->shdr[SH_HASH].sh_type = SHT_HASH;
+            elf->shdr[SH_HASH].sh_flags = SHF_ALLOC;
+            elf->shdr[SH_HASH].sh_addr = elf->dyn[i].d_un.d_ptr;
+            elf->shdr[SH_HASH].sh_offset = elf->dyn[i].d_un.d_ptr;
+            elf->shdr[SH_HASH].sh_size = get_hashtab_size(elf);
+            elf->shdr[SH_HASH].sh_info = 0;
+            elf->shdr[SH_HASH].sh_addralign = 8;
+            elf->shdr[SH_HASH].sh_entsize = 0;
+            section_list_add(elf, SH_HASH);
+            break;
+        case DT_GNU_HASH:
+            UPDATE_ADDRESS(elf, elf->dyn[i].d_un.d_ptr, base);
+            hashtab = (elf_word *) (elf->buf + elf->dyn[i].d_un.d_ptr);
+            elf->gnu_hash.nbucket = hashtab[0];
+            elf->gnu_hash.symidx = hashtab[1];
+            elf->gnu_hash.maskwords = hashtab[2];
+            elf->gnu_hash.shift2 = hashtab[3];
+            elf->gnu_hash.bloom = (elf_addr *) hashtab + 4;
+            elf->gnu_hash.buckets = hashtab + 4 + (ELF_WORD_SIZE / 32) * elf->gnu_hash.maskwords;;
+            elf->gnu_hash.chain = elf->gnu_hash.buckets + elf->gnu_hash.nbucket -
+                elf->gnu_hash.symidx;
+            valid_gnu_hash = IS_POWEROF2(elf->gnu_hash.maskwords) && elf->gnu_hash.nbucket > 0 &&
+                elf->gnu_hash.buckets != 0;
+            elf->shdr[SH_GNU_HASH].sh_name = get_strtbl_idx(shstrtab, ARRAY_SIZE(shstrtab), SH_GNU_HASH);
+            elf->shdr[SH_GNU_HASH].sh_type = SHT_GNU_HASH;
+            elf->shdr[SH_GNU_HASH].sh_flags = SHF_ALLOC;
+            elf->shdr[SH_GNU_HASH].sh_addr = elf->dyn[i].d_un.d_ptr;
+            elf->shdr[SH_GNU_HASH].sh_offset = elf->dyn[i].d_un.d_ptr;
+            elf->shdr[SH_GNU_HASH].sh_size = get_gnuhashtab_size(elf);
+            elf->shdr[SH_GNU_HASH].sh_info = 0;
+            elf->shdr[SH_GNU_HASH].sh_addralign = 8;
+            elf->shdr[SH_GNU_HASH].sh_entsize = 0;
+            section_list_add(elf, SH_GNU_HASH);
             break;
         case DT_RELA: /* TODO: add support for more sections */
         case DT_REL:
-        case DT_GNU_HASH:
         case DT_VERSYM:
             UPDATE_ADDRESS(elf, elf->dyn[i].d_un.d_ptr, base);
             break;
@@ -536,7 +627,7 @@ static bool parse_elf(struct elf *elf, pid_t pid, elf_addr base)
                 elf->shdr[SH_DATA].sh_info = 0;
                 elf->shdr[SH_DATA].sh_addralign = elf->phdr[i].p_align;
                 elf->shdr[SH_DATA].sh_entsize = 0;
-                insert_section(elf, SH_DATA);
+                section_list_add(elf, SH_DATA);
             } else if (elf->phdr[i].p_offset && elf->phdr[i].p_flags == (PF_R | PF_X)) {
                 printf("    Text segment: 0x%lx - 0x%lx (off: %lu, size: %lu bytes)\n",
                        elf->phdr[i].p_vaddr, elf->phdr[i].p_vaddr + elf->phdr[i].p_filesz,
@@ -551,7 +642,7 @@ static bool parse_elf(struct elf *elf, pid_t pid, elf_addr base)
                 elf->shdr[SH_TEXT].sh_info = 0;
                 elf->shdr[SH_TEXT].sh_addralign = elf->phdr[i].p_align;
                 elf->shdr[SH_TEXT].sh_entsize = 0;
-                insert_section(elf, SH_TEXT);
+                section_list_add(elf, SH_TEXT);
             }
             break;
         case PT_INTERP:
@@ -565,7 +656,7 @@ static bool parse_elf(struct elf *elf, pid_t pid, elf_addr base)
             elf->shdr[SH_INTERP].sh_info = 0;
             elf->shdr[SH_INTERP].sh_addralign = elf->phdr[i].p_align;
             elf->shdr[SH_INTERP].sh_entsize = 0;
-            insert_section(elf, SH_INTERP);
+            section_list_add(elf, SH_INTERP);
             break;
         case PT_DYNAMIC:
             printf("    Dynamic segment: 0x%lx - 0x%lx (size: %lu bytes)\n",
@@ -582,8 +673,17 @@ static bool parse_elf(struct elf *elf, pid_t pid, elf_addr base)
             elf->shdr[SH_DYNAMIC].sh_info = 0;
             elf->shdr[SH_DYNAMIC].sh_addralign = elf->phdr[i].p_align;
             elf->shdr[SH_DYNAMIC].sh_entsize = 0;
-            insert_section(elf, SH_DYNAMIC);
+            section_list_add(elf, SH_DYNAMIC);
             read_dynamic_segment(elf, base);
+            elf->shdr[SH_DYNSYM].sh_size = get_nsymbols(elf) * elf->shdr[SH_DYNSYM].sh_entsize;
+
+            /* update sh_link and sh_info */
+            elf->shdr[SH_DYNAMIC].sh_link = get_section_index(elf, SH_DYNSTR);
+            elf->shdr[SH_DYNSYM].sh_link = get_section_index(elf, SH_DYNSTR);
+            elf->shdr[SH_RELA_PLT].sh_link = get_section_index(elf, SH_DYNSYM);
+            elf->shdr[SH_RELA_PLT].sh_info = get_section_index(elf, SH_GOT_PLT);
+            elf->shdr[SH_HASH].sh_link = get_section_index(elf, SH_DYNSYM);
+            elf->shdr[SH_GNU_HASH].sh_link = get_section_index(elf, SH_DYNSYM);
         default:
             break;
         }

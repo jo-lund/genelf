@@ -14,6 +14,7 @@ typedef ElfN(Shdr) elf_shdr;
 typedef ElfN(Dyn) elf_dyn;
 typedef ElfN(Sym) elf_sym;
 typedef ElfN(Rela) elf_rela;
+typedef ElfN(Word) elf_word;
 typedef ElfN(Xword) elf_xword;
 typedef ElfN(Off) elf_off;
 
