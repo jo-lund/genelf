@@ -47,6 +47,7 @@ enum section_id {
     SH_DYNSYM,
     SH_HASH,
     SH_GNU_HASH,
+    SH_FINI,
     SH_SHSTRTAB,
     NUM_SECTIONS
 };
@@ -55,22 +56,6 @@ struct string_table {
     enum section_id id;
     char *str;
     unsigned int len;
-};
-
-static struct string_table shstrtab[] = {
-    { SH_NULL, "", 0 },
-    { SH_INTERP, ".interp", 7 },
-    { SH_TEXT, ".text", 5 },
-    { SH_DYNSTR, ".dynstr", 7 },
-    { SH_DYNAMIC, ".dynamic", 8 },
-    { SH_RELA_PLT, ".rela.plt", 9 },
-    { SH_INIT, ".init", 5 },
-    { SH_GOT_PLT, ".got.plt", 8 },
-    { SH_DATA, ".data", 5 },
-    { SH_DYNSYM, ".dynsym", 7 },
-    { SH_HASH, ".hash", 5 },
-    { SH_GNU_HASH, ".gnu.hash", 9 },
-    { SH_SHSTRTAB, ".shstrtab", 9 }
 };
 
 struct elf {
@@ -114,6 +99,29 @@ struct elf {
         unsigned char *buf;
         unsigned int size;
     } sections;
+};
+
+static struct string_table shstrtab[] = {
+    { SH_NULL, "", 0 },
+    { SH_INTERP, ".interp", 7 },
+    { SH_TEXT, ".text", 5 },
+    { SH_DYNSTR, ".dynstr", 7 },
+    { SH_DYNAMIC, ".dynamic", 8 },
+    { SH_RELA_PLT, ".rela.plt", 9 },
+    { SH_INIT, ".init", 5 },
+    { SH_GOT_PLT, ".got.plt", 8 },
+    { SH_DATA, ".data", 5 },
+    { SH_DYNSYM, ".dynsym", 7 },
+    { SH_HASH, ".hash", 5 },
+    { SH_GNU_HASH, ".gnu.hash", 9 },
+    { SH_FINI, ".fini", 5 },
+    { SH_SHSTRTAB, ".shstrtab", 9 }
+};
+
+static const uint8_t plt_pattern[] = {
+    0xff, 0x35, 0x00, 0x00, 0x00, 0x00, /* push <indirect address> */
+    0xff, 0x25, 0x00, 0x00, 0x00, 0x00, /* jmp <indirect address> */
+    0x0f, 0x1f, 0x40, 0x00              /* nop */
 };
 
 static bool valid_hash = false;
@@ -198,18 +206,17 @@ static int get_strtbl_idx(struct string_table *tbl, unsigned int len, int sid)
     return -1;
 }
 
-static elf_addr get_plt_addr(elf_addr init_addr)
+static elf_addr get_plt_addr(struct elf *elf)
 {
-    /*
-     * TODO: search for the first entry
-     *
-     * .PLT0: push  DWORD PTR [ebx + 4]
-     *        jmp   [ebx + 8]
-     *        nop
-     */
-    elf_addr addr = init_addr + 0x1a;
-
-    return addr + (-addr & 0xf); /* align on a 16 byte boundary */
+    for (elf_addr i = elf->shdr[SH_INIT].sh_addr; i < elf->shdr[SH_TEXT].sh_addr
+             + elf->shdr[SH_TEXT].sh_size - 16; i++) {
+        if (memcmp(&elf->buf[i], &plt_pattern[0], 2) == 0 &&
+            memcmp(&elf->buf[i + 6], &plt_pattern[6], 2) == 0 &&
+            memcmp(&elf->buf[i + 12], &plt_pattern[12], 3) == 0) {
+            return i;
+        }
+    }
+    return -1;
 }
 
 static int mem_read(pid_t pid, void *dst, const void *src, size_t len)
@@ -252,7 +259,7 @@ void generate_sht(struct elf *elf)
     struct slist *n;
     int c = 0;
 
-    offset = elf->shdr[SH_DATA].sh_offset + elf->shdr[SH_DATA].sh_size;
+    elf->size = offset = elf->shdr[SH_DATA].sh_offset + elf->shdr[SH_DATA].sh_size;
     elf->sections.buf = xmalloc(get_strtbl_size(shstrtab, shstrtab_elems) +
                                 elf->ehdr->e_shentsize * NUM_SECTIONS);
 
@@ -303,9 +310,7 @@ static elf_addr read_process(struct elf *elf, FILE *fp, char *name, pid_t pid)
     char path[PATH_MAX];
     elf_addr from, to;
     elf_off offset;
-    unsigned char *buf;
-    elf_ehdr *ehdr;
-    elf_phdr *phdr;
+    elf_addr base;
 
     offset = 0;
     while (fgets(line, BUFSIZE, fp)) {
@@ -314,44 +319,32 @@ static elf_addr read_process(struct elf *elf, FILE *fp, char *name, pid_t pid)
         if (strstr(path, name) != NULL)
             break;
     }
-    buf = xmalloc(to - from);
-    if (mem_read(pid, buf, (void *) from, to - from) == -1) {
-        free(buf);
+    elf->buf = xmalloc(to - from);
+    elf->size = to - from;
+    if (mem_read(pid, elf->buf, (void *) from, to - from) == -1) {
+        free(elf->buf);
         return 0;
     }
-    if (buf[EI_MAG0] != 0x7f || buf[EI_MAG1] != 'E' ||
-        buf[EI_MAG2] != 'L' || buf[EI_MAG3] != 'F') {
+    if (elf->buf[EI_MAG0] != 0x7f || elf->buf[EI_MAG1] != 'E' ||
+        elf->buf[EI_MAG2] != 'L' || elf->buf[EI_MAG3] != 'F') {
         err_msg("Not an ELF executable\n");
-        free(buf);
+        free(elf->buf);
         return 0;
     }
-    ehdr = (elf_ehdr *) buf;
-    phdr = (elf_phdr *) (buf + ehdr->e_phoff);
-
-    /* get the size of the loadable segments */
-    for (int i = 0; i < ehdr->e_phnum; i++) {
-        if (phdr[i].p_type == PT_LOAD) {
-            if (phdr[i].p_offset > elf->size)
-                elf->size = phdr[i].p_offset;
-            elf->size += phdr[i].p_filesz;
-        }
-    }
-
-    /* read the loadable segments */
-    elf->buf = xmalloc(elf->size);
-    for (int i = 0; i < ehdr->e_phnum; i++) {
-        if (phdr[i].p_type == PT_LOAD) {
-            if (phdr[i].p_offset > offset)
-                offset = phdr[i].p_offset;
-            if (mem_read(pid, elf->buf + offset, (void *) (from + phdr[i].p_vaddr),
-                         phdr[i].p_filesz) == -1) {
-                free(buf);
+    base = from;
+    while (fgets(line, BUFSIZE, fp)) {
+        if (sscanf(line, "%lx-%lx %*s %lx %*s %*d %s", &from, &to, &offset, path) == 4) {
+            if (strstr(path, name) == NULL)
+                break;
+            elf->size += to - from;
+            elf->buf = xrealloc(elf->buf, elf->size);
+            if (mem_read(pid, elf->buf + offset, (void *) from, to - from) == -1) {
+                free(elf->buf);
                 return 0;
-            }
+            };
         }
     }
-    free(buf);
-    return from;
+    return base;
 }
 
 char *get_procname(pid_t pid)
@@ -485,7 +478,6 @@ static void read_dynamic_segment(struct elf *elf, elf_addr base)
             elf->shdr[SH_INIT].sh_flags = SHF_EXECINSTR | SHF_ALLOC;
             elf->shdr[SH_INIT].sh_addr = elf->dyn[i].d_un.d_ptr;
             elf->shdr[SH_INIT].sh_offset = elf->dyn[i].d_un.d_ptr;
-            elf->shdr[SH_INIT].sh_size = 0; // ??
             elf->shdr[SH_INIT].sh_link = SHN_UNDEF;
             elf->shdr[SH_INIT].sh_info = 0;
             elf->shdr[SH_INIT].sh_addralign = 4;
@@ -535,7 +527,19 @@ static void read_dynamic_segment(struct elf *elf, elf_addr base)
             elf->shdr[SH_GNU_HASH].sh_entsize = 0;
             section_list_add(elf, SH_GNU_HASH);
             break;
-        case DT_RELA: /* TODO: add support for more sections */
+        case DT_FINI: /* .fini section */
+            elf->shdr[SH_FINI].sh_name = get_strtbl_idx(shstrtab, ARRAY_SIZE(shstrtab), SH_FINI);
+            elf->shdr[SH_FINI].sh_type = SHT_PROGBITS;
+            elf->shdr[SH_FINI].sh_flags = SHF_EXECINSTR | SHF_ALLOC;
+            elf->shdr[SH_FINI].sh_addr = elf->dyn[i].d_un.d_ptr;
+            elf->shdr[SH_FINI].sh_offset = elf->dyn[i].d_un.d_ptr;
+            elf->shdr[SH_FINI].sh_link = SHN_UNDEF;
+            elf->shdr[SH_FINI].sh_info = 0;
+            elf->shdr[SH_FINI].sh_addralign = 4;
+            elf->shdr[SH_FINI].sh_entsize = 0;
+            section_list_add(elf, SH_FINI);
+            break;
+        case DT_RELA:
         case DT_REL:
         case DT_VERSYM:
             UPDATE_ADDRESS(elf, elf->dyn[i].d_un.d_ptr, base);
@@ -546,7 +550,7 @@ static void read_dynamic_segment(struct elf *elf, elf_addr base)
     }
 }
 
-static void patch_got(struct elf *elf, elf_addr base)
+static bool patch_got(struct elf *elf, elf_addr base)
 {
     elf_addr plt_addr;
     elf_addr plt_entry;
@@ -562,7 +566,9 @@ static void patch_got(struct elf *elf, elf_addr base)
     elf->shdr[SH_GOT_PLT].sh_offset = elf->shdr[SH_DATA].sh_offset + elf->rela[0].r_offset -
         elf->shdr[SH_DATA].sh_addr - GOT_NRESERVED_ELEMS * sizeof(elf_addr);
 
-    plt_addr = get_plt_addr(elf->shdr[SH_INIT].sh_addr);
+    if ((plt_addr = get_plt_addr(elf)) == -1)
+        return false;
+    elf->shdr[SH_INIT].sh_size = plt_addr - elf->shdr[SH_INIT].sh_addr;
 
     /* clear GOT[1] and GOT[2] */
     memset(elf->buf + elf->shdr[SH_DATA].sh_offset + elf->shdr[SH_GOT_PLT].sh_addr +
@@ -574,7 +580,7 @@ static void patch_got(struct elf *elf, elf_addr base)
     for (int i = 0; i < GOT_NELEMS(elf); i++) {
         int sym_idx = ELF_R_SYM(elf->rela[i].r_info); /* symbol table index */
 
-        /* 6 is the size of the first instruction in PLT[n] (jmp   [ebx + name1@GOT]) */
+        /* 6 is the size of the first instruction in PLT[n] (jmp [ebx + name1@GOT]) */
         /* 16 is the size of a PLT entry */
         plt_entry = plt_addr + (i + 1) * 16 + 6;
         got_entry = *((elf_addr *) (elf->buf + elf->shdr[SH_DATA].sh_offset +
@@ -596,6 +602,7 @@ static void patch_got(struct elf *elf, elf_addr base)
                    elf->shdr[SH_DATA].sh_addr, &got_entry, sizeof(elf_addr));
         }
     }
+    return true;
 }
 
 static bool parse_elf(struct elf *elf, pid_t pid, elf_addr base)
@@ -692,8 +699,11 @@ static bool parse_elf(struct elf *elf, pid_t pid, elf_addr base)
         fprintf(stderr, "Cannot find dynamic segment");
         return false;
     }
+    /* update .fini size */
+    elf->shdr[SH_FINI].sh_size = elf->shdr[SH_TEXT].sh_addr + elf->shdr[SH_TEXT].sh_size
+        - elf->shdr[SH_FINI].sh_addr;
     if (elf->rela)
-        patch_got(elf, base);
+        return patch_got(elf, base);
     return true;
 }
 
@@ -720,7 +730,6 @@ int main(int argc, char **argv)
             break;
         case 'v':
             verbose = true;
-            printf("verbose\n");
             break;
         case 'h':
         default:
