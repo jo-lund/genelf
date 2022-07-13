@@ -1,7 +1,9 @@
 BUILDDIR := build
-
 CC := gcc
-CFLAGS += -g -std=gnu11 -Wall
+# Based on the reloc values in elf.h
+ARCH = X86_64
+WORD_SIZE = 64
+CFLAGS += -g -std=gnu11 -Wall -DELF_ARCH=$(ARCH) -DELF_WORD_SIZE=$(WORD_SIZE)
 
 sources = $(wildcard *.c)
 objects = $(patsubst %.c,$(BUILDDIR)/%.o,$(sources))
@@ -27,3 +29,8 @@ clean :
 .PHONY : tags
 tags :
 	@find . -name "*.h" -o -name "*.c" | etags -
+
+.PHONY : info
+info:
+	@echo "ARCH      : $(ARCH)  [options: 386 X86_64 SPARC MIPS ARM etc.]"
+	@echo "WORD_SIZE : $(WORD_SIZE)"
