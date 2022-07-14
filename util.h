@@ -27,6 +27,16 @@ typedef ElfN(Verneed) elf_verneed;
 typedef ElfN(Versym) elf_versym;
 typedef ElfN(Half) elf_half;
 
+#if ELF_WORD_SIZE == 64
+#define XFMT "0x%lx"
+#define AFMT "%lx"
+#define UFMT "%lu"
+#else
+#define XFMT "0x%x"
+#define AFMT "%x"
+#define UFMT "%u"
+#endif
+
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 
 static inline void *xmalloc(size_t size)

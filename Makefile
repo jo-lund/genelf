@@ -1,4 +1,6 @@
 BUILDDIR := build
+STRIP := strip
+PREFIX := /usr/local
 CC := gcc
 # Based on the reloc values in elf.h
 ARCH = X86_64
@@ -20,6 +22,9 @@ $(BUILDDIR)/%.o : %.c
 
 # Include dependency info for existing object files
 -include $(objects:.o=.d)
+
+install :
+	@install -sD --strip-program=$(STRIP) genelf $(PREFIX)/bin/genelf
 
 .PHONY : clean
 clean :
