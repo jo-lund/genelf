@@ -47,12 +47,12 @@
 /*
  * Use the correct relocation structure and return the value of the member at the given index.
  * t: type (plt or dyn)
- * m: struct member (without 'r_' prefix)
+ * m: elf_rela/elf_rel struct member (without 'r_' prefix)
  * i: index
 */
-#define get_rel(elf, t, m, i)                   \
-    ((elf)->CONCAT(CONCAT(rel, t), _type) ?     \
-     CONCAT((elf)->rela_, t)[i].CONCAT(r_, m) : \
+#define get_rel(elf, t, m, i)                          \
+    ((elf)->CONCAT(CONCAT(rel, t), _type) == DT_RELA ? \
+     CONCAT((elf)->rela_, t)[i].CONCAT(r_, m) :        \
      CONCAT((elf)->rel_, t)[i].CONCAT(r_, m))
 
 enum section_id {
@@ -603,6 +603,7 @@ static void read_dynamic_segment(struct elf *elf, elf_addr base)
 {
     elf_word *hashtab;
     elf_addr jmprel;
+    elf_xword pltrelsz;
 
     for (int i = 0; elf->dyn[i].d_tag != DT_NULL; i++) {
         switch (elf->dyn[i].d_tag) {
@@ -688,12 +689,12 @@ static void read_dynamic_segment(struct elf *elf, elf_addr base)
         case DT_RELENT:
             elf->shdr[SH_REL_DYN].sh_entsize = elf->dyn[i].d_un.d_val;
             break;
-        case DT_JMPREL: /* .rela.plt section */
+        case DT_JMPREL: /* .rela.plt/rel.plt section */
             UPDATE_ADDRESS(elf, elf->dyn[i].d_un.d_ptr, base);
             jmprel = elf->dyn[i].d_un.d_ptr;
             break;
-        case DT_PLTRELSZ: /* size of the .rela.plt section */
-            elf->shdr[SH_RELA_PLT].sh_size = elf->dyn[i].d_un.d_val;
+        case DT_PLTRELSZ: /* size of the .rela.plt/rel.plt section */
+            pltrelsz = elf->dyn[i].d_un.d_val;
             break;
         case DT_PLTREL:
             elf->relplt_type = elf->dyn[i].d_un.d_val;
@@ -836,6 +837,7 @@ static void read_dynamic_segment(struct elf *elf, elf_addr base)
         elf->shdr[SH_REL_PLT].sh_addr = jmprel;
         elf->shdr[SH_REL_PLT].sh_addralign = 8;
         elf->shdr[SH_REL_PLT].sh_entsize = sizeof(elf_rel);
+        elf->shdr[SH_REL_PLT].sh_size = pltrelsz;
         section_list_add(elf, SH_REL_PLT);
     } else if (elf->relplt_type == DT_RELA) {
         elf->rela_plt = (elf_rela *) (elf->buf + jmprel);
@@ -846,6 +848,7 @@ static void read_dynamic_segment(struct elf *elf, elf_addr base)
         elf->shdr[SH_RELA_PLT].sh_addr = jmprel;
         elf->shdr[SH_RELA_PLT].sh_addralign = 8;
         elf->shdr[SH_RELA_PLT].sh_entsize = sizeof(elf_rela);
+        elf->shdr[SH_RELA_PLT].sh_size = pltrelsz;
         section_list_add(elf, SH_RELA_PLT);
     }
 }
@@ -1077,7 +1080,7 @@ static bool parse_elf(struct elf *elf, pid_t pid, elf_addr base)
     if (elf->reldyn_type == DT_RELA)
         elf->shdr[SH_RELA_DYN].sh_link = get_section_idx(elf, SH_DYNSYM);
     else
-        elf->shdr[SH_RELA_DYN].sh_link = get_section_idx(elf, SH_DYNSYM);
+        elf->shdr[SH_REL_DYN].sh_link = get_section_idx(elf, SH_DYNSYM);
     elf->shdr[SH_VERSYM].sh_link = get_section_idx(elf, SH_DYNSYM);
     elf->shdr[SH_VERNEED].sh_link = get_section_idx(elf, SH_DYNSTR);
     return true;
