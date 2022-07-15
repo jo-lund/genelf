@@ -33,13 +33,13 @@
 #define ALIGN(a, b) (((a) + ((b) - 1)) & (-b))
 #define IS_POWEROF2(x) ((x) > 0 && ((x) & (x - 1)) == 0)
 #define GOTPLT_NELEMS(elf) \
-    ((elf)->rel_type == DT_RELA ? \
+    ((elf)->relplt_type == DT_RELA ? \
      ((elf)->shdr[SH_RELA_PLT].sh_size / sizeof(elf_rela)) : \
      ((elf)->shdr[SH_REL_PLT].sh_size / sizeof(elf_rel)))
 #define GOTPLT_NRESERVED_ELEMS 3
 #define PLTENTSZ 16  /* PLT entry size */
 #define GOT_NELEMS(elf) \
-    ((elf)->rel_type == DT_RELA ? \
+    ((elf)->reldyn_type == DT_RELA ? \
      ((elf)->shdr[SH_RELA_DYN].sh_size / (elf)->shdr[SH_RELA_DYN].sh_entsize) : \
      ((elf)->shdr[SH_REL_DYN].sh_size / (elf)->shdr[SH_REL_DYN].sh_entsize))
 #define GOT_SIZE(elf) (GOT_NELEMS(elf) * 8)
@@ -51,7 +51,7 @@
  * i: index
 */
 #define get_rel(elf, t, m, i)                   \
-    ((elf)->rel_type == DT_RELA ?               \
+    ((elf)->CONCAT(CONCAT(rel, t), _type) ?     \
      CONCAT((elf)->rela_, t)[i].CONCAT(r_, m) : \
      CONCAT((elf)->rel_, t)[i].CONCAT(r_, m))
 
@@ -104,11 +104,12 @@ struct elf {
         elf_rela *rela_plt;
         elf_rel *rel_plt;
     };
+    elf_sxword relplt_type;
     union {
         elf_rela *rela_dyn;
         elf_rel *rel_dyn;
     };
-    elf_sxword rel_type;
+    elf_sxword reldyn_type;
     unsigned char *dynstr;
     unsigned char *buf;
     unsigned int size;
@@ -154,7 +155,7 @@ static struct string_table shstrtab[] = {
     { SH_RELA_DYN, ".rela.dyn", 9 },
     { SH_REL_DYN, ".rel.dyn", 8 },
     { SH_RELA_PLT, ".rela.plt", 9 },
-    { SH_RELA_PLT, ".rel.plt", 8 },
+    { SH_REL_PLT, ".rel.plt", 8 },
     { SH_INIT, ".init", 5 },
     { SH_GOT_PLT, ".got.plt", 8 },
     { SH_DATA, ".data", 5 },
@@ -650,6 +651,7 @@ static void read_dynamic_segment(struct elf *elf, elf_addr base)
             elf->shdr[SH_DYNSYM].sh_entsize = elf->dyn[i].d_un.d_val;
             break;
         case DT_RELA: /* .rela.dyn section */
+            elf->reldyn_type = DT_RELA;
             UPDATE_ADDRESS(elf, elf->dyn[i].d_un.d_ptr, base);
             elf->rela_dyn = (elf_rela *) (elf->buf + elf->dyn[i].d_un.d_ptr);
             elf->shdr[SH_RELA_DYN].sh_offset = get_offset(elf, elf->dyn[i].d_un.d_ptr);
@@ -668,6 +670,7 @@ static void read_dynamic_segment(struct elf *elf, elf_addr base)
             elf->shdr[SH_RELA_DYN].sh_entsize = elf->dyn[i].d_un.d_val;
             break;
         case DT_REL:
+            elf->reldyn_type = DT_REL;
             UPDATE_ADDRESS(elf, elf->dyn[i].d_un.d_ptr, base);
             elf->rel_dyn = (elf_rel *) (elf->buf + elf->dyn[i].d_un.d_ptr);
             elf->shdr[SH_REL_DYN].sh_offset = get_offset(elf, elf->dyn[i].d_un.d_ptr);
@@ -693,7 +696,7 @@ static void read_dynamic_segment(struct elf *elf, elf_addr base)
             elf->shdr[SH_RELA_PLT].sh_size = elf->dyn[i].d_un.d_val;
             break;
         case DT_PLTREL:
-            elf->rel_type = elf->dyn[i].d_un.d_val;
+            elf->relplt_type = elf->dyn[i].d_un.d_val;
             break;
         case DT_INIT: /* .init section */
             elf->shdr[SH_INIT].sh_name = get_strtbl_idx(shstrtab, ARRAY_SIZE(shstrtab), SH_INIT);
@@ -824,7 +827,7 @@ static void read_dynamic_segment(struct elf *elf, elf_addr base)
             break;
         }
     }
-    if (elf->rel_type == DT_REL) {
+    if (elf->relplt_type == DT_REL) {
         elf->rel_plt = (elf_rel *) (elf->buf + jmprel);
         elf->shdr[SH_REL_PLT].sh_offset = get_offset(elf, jmprel);
         elf->shdr[SH_REL_PLT].sh_name = get_strtbl_idx(shstrtab, ARRAY_SIZE(shstrtab), SH_REL_PLT);
@@ -834,7 +837,7 @@ static void read_dynamic_segment(struct elf *elf, elf_addr base)
         elf->shdr[SH_REL_PLT].sh_addralign = 8;
         elf->shdr[SH_REL_PLT].sh_entsize = sizeof(elf_rel);
         section_list_add(elf, SH_REL_PLT);
-    } else {
+    } else if (elf->relplt_type == DT_RELA) {
         elf->rela_plt = (elf_rela *) (elf->buf + jmprel);
         elf->shdr[SH_RELA_PLT].sh_offset = get_offset(elf, jmprel);
         elf->shdr[SH_RELA_PLT].sh_name = get_strtbl_idx(shstrtab, ARRAY_SIZE(shstrtab), SH_RELA_PLT);
@@ -850,7 +853,6 @@ static void read_dynamic_segment(struct elf *elf, elf_addr base)
 static bool parse_elf(struct elf *elf, pid_t pid, elf_addr base)
 {
     int nsym;
-    bool ret = false;
 
     elf->ehdr = (elf_ehdr *) elf->buf;
     elf->phdr = (elf_phdr *) (elf->buf + elf->ehdr->e_phoff);
@@ -936,7 +938,10 @@ static bool parse_elf(struct elf *elf, pid_t pid, elf_addr base)
             nsym = get_nsymbols(elf);
             elf->shdr[SH_DYNSYM].sh_size = nsym * elf->shdr[SH_DYNSYM].sh_entsize;
             elf->shdr[SH_VERSYM].sh_size = nsym * sizeof(elf_half);
-            elf->shdr[SH_VERNEED].sh_size = elf->shdr[SH_RELA_DYN].sh_addr - elf->shdr[SH_VERNEED].sh_addr;
+            if (elf->reldyn_type == DT_RELA)
+                elf->shdr[SH_VERNEED].sh_size = elf->shdr[SH_RELA_DYN].sh_addr - elf->shdr[SH_VERNEED].sh_addr;
+            else
+                elf->shdr[SH_VERNEED].sh_size = elf->shdr[SH_REL_DYN].sh_addr - elf->shdr[SH_VERNEED].sh_addr;
             break;
         case PT_NOTE:
             elf->shdr[SH_NOTE].sh_name = get_strtbl_idx(shstrtab, ARRAY_SIZE(shstrtab), SH_NOTE);
@@ -984,12 +989,16 @@ static bool parse_elf(struct elf *elf, pid_t pid, elf_addr base)
         err_msg("Cannot find dynamic segment");
         return false;
     }
-    if (elf->rela_plt)
-        ret = patch_got(elf, base);
+    if (elf->rela_plt && !patch_got(elf, base))
+        return false;
 
     /* Update .text and .fini  */
-    elf->shdr[SH_TEXT].sh_addr = ALIGN(elf->shdr[SH_PLT_GOT].sh_addr + elf->shdr[SH_PLT_GOT].sh_size,
-                                       elf->shdr[SH_TEXT].sh_addralign);
+    if (elf->rela_plt)
+        elf->shdr[SH_TEXT].sh_addr = ALIGN(elf->shdr[SH_PLT_GOT].sh_addr + elf->shdr[SH_PLT_GOT].sh_size,
+                                           elf->shdr[SH_TEXT].sh_addralign);
+    else
+        elf->shdr[SH_TEXT].sh_addr = ALIGN(elf->shdr[SH_INIT].sh_addr + elf->shdr[SH_INIT].sh_size,
+                                           elf->shdr[SH_TEXT].sh_addralign);
     elf->shdr[SH_TEXT].sh_offset = get_offset(elf, elf->shdr[SH_TEXT].sh_addr);
     elf->shdr[SH_TEXT].sh_size = elf->shdr[SH_INIT].sh_addr + elf->phdr[ph_text].p_filesz
         - elf->shdr[SH_TEXT].sh_addr;
@@ -1054,14 +1063,24 @@ static bool parse_elf(struct elf *elf, pid_t pid, elf_addr base)
     elf->shdr[SH_DYNAMIC].sh_link = get_section_idx(elf, SH_DYNSTR);
     elf->shdr[SH_DYNSYM].sh_link = get_section_idx(elf, SH_DYNSTR);
     elf->shdr[SH_DYNSYM].sh_info = get_idx_last_local_sym(elf);
-    elf->shdr[SH_RELA_PLT].sh_link = get_section_idx(elf, SH_DYNSYM);
-    elf->shdr[SH_RELA_PLT].sh_info = get_section_idx(elf, SH_GOT_PLT);
+    if (elf->rela_plt) {
+        if (elf->relplt_type == DT_RELA) {
+            elf->shdr[SH_RELA_PLT].sh_link = get_section_idx(elf, SH_DYNSYM);
+            elf->shdr[SH_RELA_PLT].sh_info = get_section_idx(elf, SH_GOT_PLT);
+        } else {
+            elf->shdr[SH_REL_PLT].sh_link = get_section_idx(elf, SH_DYNSYM);
+            elf->shdr[SH_REL_PLT].sh_info = get_section_idx(elf, SH_GOT_PLT);
+        }
+    }
     elf->shdr[SH_HASH].sh_link = get_section_idx(elf, SH_DYNSYM);
     elf->shdr[SH_GNU_HASH].sh_link = get_section_idx(elf, SH_DYNSYM);
-    elf->shdr[SH_RELA_DYN].sh_link = get_section_idx(elf, SH_DYNSYM);;
+    if (elf->reldyn_type == DT_RELA)
+        elf->shdr[SH_RELA_DYN].sh_link = get_section_idx(elf, SH_DYNSYM);
+    else
+        elf->shdr[SH_RELA_DYN].sh_link = get_section_idx(elf, SH_DYNSYM);
     elf->shdr[SH_VERSYM].sh_link = get_section_idx(elf, SH_DYNSYM);
     elf->shdr[SH_VERNEED].sh_link = get_section_idx(elf, SH_DYNSTR);
-    return ret;
+    return true;
 }
 
 int main(int argc, char **argv)
