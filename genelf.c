@@ -24,10 +24,10 @@
 
 #define DEFAULT_FILE "elf.bin"
 #define BUFSIZE 4096
-#define UPDATE_ADDRESS(elf, addr, base)    \
-    do {                                   \
-        if ((elf)->ehdr->e_type == ET_DYN) \
-            (addr) -= (base);              \
+#define UPDATE_ADDRESS(elf, addr)               \
+    do {                                        \
+        if ((elf)->ehdr->e_type == ET_DYN)      \
+            (addr) -= (elf->base);              \
     } while (0)
 
 #define ALIGN(a, b) (((a) + ((b) - 1)) & (-b))
@@ -100,6 +100,7 @@ struct elf {
     elf_shdr *shdr;
     elf_dyn *dyn;
     elf_sym *sym;
+    elf_addr base;
     union {
         elf_rela *rela_plt;
         elf_rel *rel_plt;
@@ -280,19 +281,19 @@ static int get_strtbl_idx(struct string_table *tbl, unsigned int len, int sid)
 static elf_addr get_plt_addr(struct elf *elf, int word_size)
 {
     if (word_size == 64) {
-        for (elf_addr i = elf->shdr[SH_INIT].sh_addr; i < elf->phdr[ph_text].p_vaddr +
-                 elf->phdr[ph_text].p_memsz - 16; i++) {
+        for (elf_addr i = elf->shdr[SH_INIT].sh_offset; i < elf->phdr[ph_text].p_offset +
+                 elf->phdr[ph_text].p_filesz - 16; i++) {
             if (memcmp(&elf->buf[i], &plt_pattern[0], 2) == 0 &&
                 memcmp(&elf->buf[i + 6], &plt_pattern[6], 2) == 0 &&
                 memcmp(&elf->buf[i + 12], &plt_pattern[12], 3) == 0)
-                return i;
+                return elf->ehdr->e_type == ET_EXEC ? i + elf->base : i;
         }
     } else if (word_size == 32) {
-        for (elf_addr i = elf->shdr[SH_INIT].sh_addr; i < elf->phdr[ph_text].p_vaddr +
-                 elf->phdr[ph_text].p_memsz - 12; i++) {
+        for (elf_addr i = elf->shdr[SH_INIT].sh_offset; i < elf->phdr[ph_text].p_offset +
+                 elf->phdr[ph_text].p_filesz - 12; i++) {
             if (memcmp(&elf->buf[i], &plt_pattern[0], 3) == 0 &&
                 memcmp(&elf->buf[i + 6], &plt_pattern[6], 3) == 0)
-                return i;
+                return elf->ehdr->e_type == ET_EXEC ? i + elf->base : i;
         }
     }
     return -1;
@@ -439,13 +440,12 @@ static void generate_sht(struct elf *elf)
     memcpy(elf->buf, elf->ehdr, elf->ehdr->e_ehsize);
 }
 
-static elf_addr read_process(struct elf *elf, FILE *fp, char *name, pid_t pid)
+static bool read_process(struct elf *elf, FILE *fp, char *name, pid_t pid)
 {
     char line[BUFSIZE];
     char path[PATH_MAX];
     elf_addr from, to;
     elf_off offset;
-    elf_addr base;
 
     offset = 0;
     while (fgets(line, BUFSIZE, fp)) {
@@ -459,15 +459,15 @@ static elf_addr read_process(struct elf *elf, FILE *fp, char *name, pid_t pid)
     if (mem_read(pid, elf->buf, (void *) from, to - from) == -1) {
         perror("mem_read error");
         free(elf->buf);
-        return 0;
+        return false;
     }
     if (elf->buf[EI_MAG0] != 0x7f || elf->buf[EI_MAG1] != 'E' ||
         elf->buf[EI_MAG2] != 'L' || elf->buf[EI_MAG3] != 'F') {
         err_msg("Not an ELF executable");
         free(elf->buf);
-        return 0;
+        return false;
     }
-    base = from;
+    elf->base = from;
     while (fgets(line, BUFSIZE, fp)) {
         if (sscanf(line, AFMT "-" AFMT "%*s " AFMT " %*s %*d %s", &from, &to, &offset, path) == 4) {
             if (strstr(path, name) == NULL)
@@ -480,7 +480,7 @@ static elf_addr read_process(struct elf *elf, FILE *fp, char *name, pid_t pid)
             };
         }
     }
-    return base;
+    return true;
 }
 
 char *get_procname(pid_t pid)
@@ -540,7 +540,7 @@ static void update_plt_section(struct elf *elf, elf_addr addr)
     section_list_add(elf, SH_PLT_GOT);
 }
 
-static bool patch_got(struct elf *elf, elf_addr base)
+static bool patch_got(struct elf *elf)
 {
     elf_addr plt_addr;
     elf_addr plt_entry;
@@ -577,7 +577,7 @@ static bool patch_got(struct elf *elf, elf_addr base)
         plt_entry = plt_addr + (i + 1) * PLTENTSZ + 6;
         got_entry = *((elf_addr *) (elf->buf + elf->phdr[ph_data].p_offset +
                                     get_rel(elf, plt, offset, i) - elf->phdr[ph_data].p_vaddr));
-        UPDATE_ADDRESS(elf, got_entry, base);
+        UPDATE_ADDRESS(elf, got_entry);
         if (plt_entry != got_entry) {
             memcpy(elf->buf + elf->phdr[ph_data].p_offset + get_rel(elf, plt, offset, i) -
                    elf->phdr[ph_data].p_vaddr, &plt_entry, sizeof(elf_addr));
@@ -599,7 +599,7 @@ static bool patch_got(struct elf *elf, elf_addr base)
     return true;
 }
 
-static void read_dynamic_segment(struct elf *elf, elf_addr base)
+static void read_dynamic_segment(struct elf *elf)
 {
     elf_word *hashtab;
     elf_addr jmprel;
@@ -608,7 +608,7 @@ static void read_dynamic_segment(struct elf *elf, elf_addr base)
     for (int i = 0; elf->dyn[i].d_tag != DT_NULL; i++) {
         switch (elf->dyn[i].d_tag) {
         case DT_PLTGOT: /* .got.plt section */
-            UPDATE_ADDRESS(elf, elf->dyn[i].d_un.d_ptr, base);
+            UPDATE_ADDRESS(elf, elf->dyn[i].d_un.d_ptr);
             elf->shdr[SH_GOT_PLT].sh_offset = get_offset(elf, elf->dyn[i].d_un.d_ptr);
             elf->shdr[SH_GOT_PLT].sh_name = get_strtbl_idx(shstrtab, ARRAY_SIZE(shstrtab), SH_GOT_PLT);
             elf->shdr[SH_GOT_PLT].sh_type = SHT_PROGBITS;
@@ -621,9 +621,9 @@ static void read_dynamic_segment(struct elf *elf, elf_addr base)
             section_list_add(elf, SH_GOT_PLT);
             break;
         case DT_STRTAB: /* .dynstr section */
-            UPDATE_ADDRESS(elf, elf->dyn[i].d_un.d_ptr, base);
+            elf->dynstr = elf->buf + elf->dyn[i].d_un.d_ptr - elf->base;
+            UPDATE_ADDRESS(elf, elf->dyn[i].d_un.d_ptr);
             elf->shdr[SH_DYNSTR].sh_offset = get_offset(elf, elf->dyn[i].d_un.d_ptr);
-            elf->dynstr = elf->buf + elf->dyn[i].d_un.d_ptr;
             elf->shdr[SH_DYNSTR].sh_name = get_strtbl_idx(shstrtab, ARRAY_SIZE(shstrtab), SH_DYNSTR);
             elf->shdr[SH_DYNSTR].sh_type = SHT_STRTAB;
             elf->shdr[SH_DYNSTR].sh_flags = SHF_ALLOC;
@@ -638,9 +638,9 @@ static void read_dynamic_segment(struct elf *elf, elf_addr base)
             elf->shdr[SH_DYNSTR].sh_size = elf->dyn[i].d_un.d_val;
             break;
         case DT_SYMTAB: /* .dynsym section */
-            UPDATE_ADDRESS(elf, elf->dyn[i].d_un.d_ptr, base);
+            elf->sym = (elf_sym *) (elf->buf + elf->dyn[i].d_un.d_ptr - elf->base);
+            UPDATE_ADDRESS(elf, elf->dyn[i].d_un.d_ptr);
             elf->shdr[SH_DYNSYM].sh_offset = get_offset(elf, elf->dyn[i].d_un.d_ptr);
-            elf->sym = (elf_sym *) (elf->buf + elf->dyn[i].d_un.d_ptr);
             elf->shdr[SH_DYNSYM].sh_name = get_strtbl_idx(shstrtab, ARRAY_SIZE(shstrtab), SH_DYNSYM);
             elf->shdr[SH_DYNSYM].sh_type = SHT_DYNSYM;
             elf->shdr[SH_DYNSYM].sh_flags = SHF_ALLOC;
@@ -653,8 +653,8 @@ static void read_dynamic_segment(struct elf *elf, elf_addr base)
             break;
         case DT_RELA: /* .rela.dyn section */
             elf->reldyn_type = DT_RELA;
-            UPDATE_ADDRESS(elf, elf->dyn[i].d_un.d_ptr, base);
-            elf->rela_dyn = (elf_rela *) (elf->buf + elf->dyn[i].d_un.d_ptr);
+            elf->rela_dyn = (elf_rela *) (elf->buf + elf->dyn[i].d_un.d_ptr - elf->base);
+            UPDATE_ADDRESS(elf, elf->dyn[i].d_un.d_ptr);
             elf->shdr[SH_RELA_DYN].sh_offset = get_offset(elf, elf->dyn[i].d_un.d_ptr);
             elf->shdr[SH_RELA_DYN].sh_name = get_strtbl_idx(shstrtab, ARRAY_SIZE(shstrtab), SH_RELA_DYN);
             elf->shdr[SH_RELA_DYN].sh_type = SHT_RELA;
@@ -672,8 +672,8 @@ static void read_dynamic_segment(struct elf *elf, elf_addr base)
             break;
         case DT_REL:
             elf->reldyn_type = DT_REL;
-            UPDATE_ADDRESS(elf, elf->dyn[i].d_un.d_ptr, base);
-            elf->rel_dyn = (elf_rel *) (elf->buf + elf->dyn[i].d_un.d_ptr);
+            elf->rel_dyn = (elf_rel *) (elf->buf + elf->dyn[i].d_un.d_ptr - elf->base);
+            UPDATE_ADDRESS(elf, elf->dyn[i].d_un.d_ptr);
             elf->shdr[SH_REL_DYN].sh_offset = get_offset(elf, elf->dyn[i].d_un.d_ptr);
             elf->shdr[SH_REL_DYN].sh_name = get_strtbl_idx(shstrtab, ARRAY_SIZE(shstrtab), SH_REL_DYN);
             elf->shdr[SH_REL_DYN].sh_type = SHT_REL;
@@ -690,8 +690,8 @@ static void read_dynamic_segment(struct elf *elf, elf_addr base)
             elf->shdr[SH_REL_DYN].sh_entsize = elf->dyn[i].d_un.d_val;
             break;
         case DT_JMPREL: /* .rela.plt/rel.plt section */
-            UPDATE_ADDRESS(elf, elf->dyn[i].d_un.d_ptr, base);
             jmprel = elf->dyn[i].d_un.d_ptr;
+            UPDATE_ADDRESS(elf, elf->dyn[i].d_un.d_ptr);
             break;
         case DT_PLTRELSZ: /* size of the .rela.plt/rel.plt section */
             pltrelsz = elf->dyn[i].d_un.d_val;
@@ -712,7 +712,7 @@ static void read_dynamic_segment(struct elf *elf, elf_addr base)
             section_list_add(elf, SH_INIT);
             break;
         case DT_HASH:
-            UPDATE_ADDRESS(elf, elf->dyn[i].d_un.d_ptr, base);
+            UPDATE_ADDRESS(elf, elf->dyn[i].d_un.d_ptr);
             hashtab = (elf_word *) (elf->buf + elf->dyn[i].d_un.d_ptr);
             elf->hash.nbucket = hashtab[0];
             elf->hash.nchain = hashtab[1];
@@ -761,8 +761,8 @@ static void read_dynamic_segment(struct elf *elf, elf_addr base)
             elf->shdr[SH_FINI_ARRAY].sh_size = elf->dyn[i].d_un.d_val;
             break;
         case DT_GNU_HASH:
-            UPDATE_ADDRESS(elf, elf->dyn[i].d_un.d_ptr, base);
-            hashtab = (elf_word *) (elf->buf + elf->dyn[i].d_un.d_ptr);
+            hashtab = (elf_word *) (elf->buf + elf->dyn[i].d_un.d_ptr - elf->base);
+            UPDATE_ADDRESS(elf, elf->dyn[i].d_un.d_ptr);
             elf->gnu_hash.nbucket = hashtab[0];
             elf->gnu_hash.symidx = hashtab[1];
             elf->gnu_hash.maskwords = hashtab[2];
@@ -812,7 +812,7 @@ static void read_dynamic_segment(struct elf *elf, elf_addr base)
             elf->shdr[SH_VERNEED].sh_info = elf->dyn[i].d_un.d_val;
             break;
         case DT_VERSYM: /* .gnu_version section */
-            UPDATE_ADDRESS(elf, elf->dyn[i].d_un.d_ptr, base);
+            UPDATE_ADDRESS(elf, elf->dyn[i].d_un.d_ptr);
             elf->shdr[SH_VERSYM].sh_name = get_strtbl_idx(shstrtab, ARRAY_SIZE(shstrtab), SH_VERSYM);
             elf->shdr[SH_VERSYM].sh_type = SHT_GNU_versym;
             elf->shdr[SH_VERSYM].sh_flags = SHF_ALLOC;
@@ -829,7 +829,8 @@ static void read_dynamic_segment(struct elf *elf, elf_addr base)
         }
     }
     if (elf->relplt_type == DT_REL) {
-        elf->rel_plt = (elf_rel *) (elf->buf + jmprel);
+        elf->rel_plt = (elf_rel *) (elf->buf + jmprel - elf->base);
+        UPDATE_ADDRESS(elf, jmprel);
         elf->shdr[SH_REL_PLT].sh_offset = get_offset(elf, jmprel);
         elf->shdr[SH_REL_PLT].sh_name = get_strtbl_idx(shstrtab, ARRAY_SIZE(shstrtab), SH_REL_PLT);
         elf->shdr[SH_REL_PLT].sh_type = SHT_REL;
@@ -840,7 +841,8 @@ static void read_dynamic_segment(struct elf *elf, elf_addr base)
         elf->shdr[SH_REL_PLT].sh_size = pltrelsz;
         section_list_add(elf, SH_REL_PLT);
     } else if (elf->relplt_type == DT_RELA) {
-        elf->rela_plt = (elf_rela *) (elf->buf + jmprel);
+        elf->rela_plt = (elf_rela *) (elf->buf + jmprel - elf->base);
+        UPDATE_ADDRESS(elf, jmprel);
         elf->shdr[SH_RELA_PLT].sh_offset = get_offset(elf, jmprel);
         elf->shdr[SH_RELA_PLT].sh_name = get_strtbl_idx(shstrtab, ARRAY_SIZE(shstrtab), SH_RELA_PLT);
         elf->shdr[SH_RELA_PLT].sh_type = SHT_RELA;
@@ -853,7 +855,7 @@ static void read_dynamic_segment(struct elf *elf, elf_addr base)
     }
 }
 
-static bool parse_elf(struct elf *elf, pid_t pid, elf_addr base)
+static bool parse_elf(struct elf *elf, pid_t pid)
 {
     int nsym;
 
@@ -937,7 +939,7 @@ static bool parse_elf(struct elf *elf, pid_t pid, elf_addr base)
             elf->shdr[SH_DYNAMIC].sh_addralign = elf->phdr[i].p_align;
             elf->shdr[SH_DYNAMIC].sh_entsize = 0;
             section_list_add(elf, SH_DYNAMIC);
-            read_dynamic_segment(elf, base);
+            read_dynamic_segment(elf);
             nsym = get_nsymbols(elf);
             elf->shdr[SH_DYNSYM].sh_size = nsym * elf->shdr[SH_DYNSYM].sh_entsize;
             elf->shdr[SH_VERSYM].sh_size = nsym * sizeof(elf_half);
@@ -992,7 +994,7 @@ static bool parse_elf(struct elf *elf, pid_t pid, elf_addr base)
         err_msg("Cannot find dynamic segment");
         return false;
     }
-    if (elf->rela_plt && !patch_got(elf, base))
+    if (elf->rela_plt && !patch_got(elf))
         return false;
 
     /* Update .text and .fini  */
@@ -1094,7 +1096,6 @@ int main(int argc, char **argv)
     int opt;
     struct elf elf;
     char *procname = NULL;
-    elf_addr base_addr;
 
     while ((opt = getopt(argc, argv, "p:r:hv")) != -1) {
         switch (opt) {
@@ -1141,7 +1142,7 @@ int main(int argc, char **argv)
         }
         ptrace(PTRACE_ATTACH, pid, NULL, NULL);
         waitpid(pid, NULL, 0);
-        if ((base_addr = read_process(&elf, fp, procname, pid)) == 0) {
+        if (!read_process(&elf, fp, procname, pid)) {
             free(procname);
             fclose(fp);
             err_quit("Error reading process");
@@ -1164,7 +1165,7 @@ int main(int argc, char **argv)
             err_sys("mmap error");
         close(fd);
     }
-    if (!parse_elf(&elf, pid, base_addr))
+    if (!parse_elf(&elf, pid))
         goto done;
     generate_sht(&elf);
     write_file(&elf);
