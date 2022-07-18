@@ -11,7 +11,7 @@ struct slist {
 typedef int (*slist_cmp)(const struct slist *p1, const struct slist *p2);
 
 /* Add element sorted based on the slist_cmp function */
-void slist_add(struct slist *head, struct slist *n, slist_cmp fn)
+static inline void slist_add(struct slist *head, struct slist *n, slist_cmp fn)
 {
     struct slist **t = &head;
 
@@ -25,7 +25,7 @@ void slist_add(struct slist *head, struct slist *n, slist_cmp fn)
     *t = n;
 }
 
-void slist_append(struct slist *head, struct slist *n)
+static inline void slist_append(struct slist *head, struct slist *n)
 {
     struct slist **t = &head;
 
@@ -35,7 +35,7 @@ void slist_append(struct slist *head, struct slist *n)
     *t = n;
 }
 
-void slist_remove(struct slist *head, struct slist *n)
+static inline void slist_remove(struct slist *head, struct slist *n)
 {
     struct slist **t = &head;
 
@@ -47,7 +47,7 @@ void slist_remove(struct slist *head, struct slist *n)
     }
 }
 
-unsigned int slist_size(struct slist *head)
+static inline unsigned int slist_size(struct slist *head)
 {
     unsigned int size = 0;
 

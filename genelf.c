@@ -12,15 +12,16 @@
 #include <sys/wait.h>
 #include <errno.h>
 #include <ctype.h>
-#include <elf.h>
 #include <stdbool.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <limits.h>
+#include "genelf.h"
 #include "error.h"
-#include "util.h"
 #include "slist.h"
+#include "util.h"
+#include "machdep.h"
 
 #define DEFAULT_FILE "elf.bin"
 #define BUFSIZE 4096
@@ -38,113 +39,11 @@
      ((elf)->shdr[SH_REL_PLT].sh_size / sizeof(elf_rel)))
 #define GOTPLT_NRESERVED_ELEMS 3
 #define PLTENTSZ 16  /* PLT entry size */
-#define GOT_NELEMS(elf) \
-    ((elf)->reldyn_type == DT_RELA ? \
-     ((elf)->shdr[SH_RELA_DYN].sh_size / (elf)->shdr[SH_RELA_DYN].sh_entsize) : \
-     ((elf)->shdr[SH_REL_DYN].sh_size / (elf)->shdr[SH_REL_DYN].sh_entsize))
-#define GOT_SIZE(elf) (GOT_NELEMS(elf) * 8)
-
-/*
- * Use the correct relocation structure and return the value of the member at the given index.
- * t: type (plt or dyn)
- * m: elf_rela/elf_rel struct member (without 'r_' prefix)
- * i: index
-*/
-#define get_rel(elf, t, m, i)                          \
-    ((elf)->CONCAT(CONCAT(rel, t), _type) == DT_RELA ? \
-     CONCAT((elf)->rela_, t)[i].CONCAT(r_, m) :        \
-     CONCAT((elf)->rel_, t)[i].CONCAT(r_, m))
-
-enum section_id {
-    SH_NULL,
-    SH_INTERP,
-    SH_TEXT,
-    SH_DYNSTR,
-    SH_DYNAMIC,
-    SH_RELA_DYN,
-    SH_REL_DYN,
-    SH_RELA_PLT,
-    SH_REL_PLT,
-    SH_INIT,
-    SH_GOT_PLT,
-    SH_DATA,
-    SH_DYNSYM,
-    SH_HASH,
-    SH_GNU_HASH,
-    SH_VERNEED,
-    SH_VERSYM,
-    SH_PLT,
-    SH_PLT_GOT,
-    SH_FINI,
-    SH_SHSTRTAB,
-    SH_NOTE,
-    SH_EH_FRAME_HDR,
-    SH_EH_FRAME,
-    SH_RODATA,
-    SH_INIT_ARRAY,
-    SH_FINI_ARRAY,
-    SH_GOT,
-    SH_BSS,
-    NUM_SECTIONS
-};
 
 struct string_table {
     enum section_id id;
     char *str;
     unsigned int len;
-};
-
-struct elf {
-    elf_ehdr *ehdr;
-    elf_phdr *phdr;
-    elf_shdr *shdr;
-    elf_dyn *dyn;
-    elf_sym *sym;
-    elf_addr base;
-    union {
-        elf_rela *rela_plt;
-        elf_rel *rel_plt;
-    };
-    elf_sxword relplt_type;
-    union {
-        elf_rela *rela_dyn;
-        elf_rel *rel_dyn;
-    };
-    elf_sxword reldyn_type;
-    unsigned char *dynstr;
-    unsigned char *buf;
-    unsigned int size;
-    struct {
-        elf_word nbucket;
-        elf_word nchain;
-        elf_word *bucket; /* hash table buckets array */
-        elf_word *chain;  /* hash table chain array */
-    } hash;
-    struct {
-        elf_word nbucket;
-        elf_word symidx;    /* first accessible symbol in dynsym table */
-        elf_word maskwords; /* bloom filter words */
-        elf_word shift2;    /* bloom filter shift words */
-        elf_addr *bloom;    /* bloom filter */
-        elf_word *buckets;  /* hash table buckets array */
-        elf_word *chain;    /* hash table value array */
-    } gnu_hash;
-
-    /* section headers sorted by offset */
-    struct section_list {
-        struct slist head;
-        elf_shdr *shdr;
-        int id;
-    } *section_list;
-
-    /*
-     * Sections not associated with a segment, e.g. .symtab, .strtab etc., and
-     * the section header table.
-     */
-    struct section {
-        unsigned char *buf;
-        unsigned int size;
-    } sections;
 };
 
 static struct string_table shstrtab[] = {
@@ -178,28 +77,11 @@ static struct string_table shstrtab[] = {
 
 };
 
-#if ELF_WORD_SIZE == 64
-/*
- * Push and jmp use 1 byte opcodes and modR/M byte, nop uses two bytes opcode
- * and modR/M byte
- */
-#define PLT_OPCODES                                                   \
-    0xff, 0x35, 0x00, 0x00, 0x00, 0x00, /* push <indirect address> */ \
-    0xff, 0x25, 0x00, 0x00, 0x00, 0x00, /* jmp <indirect address> */  \
-    0x0f, 0x1f, 0x40, 0x00              /* nop */
-#else
-#define PLT_OPCODES                                                    \
-    0xff, 0xb3, 0x04, 0x00, 0x00, 0x00, /* push DWORD PTR [ebx+0x4] */ \
-    0xff, 0xa3, 0x08, 0x00, 0x00, 0x00, /* jmp  DWORD PTR [ebx+0x8] */ \
-    0x00, 0x00
-#endif
-
-static const uint8_t plt_pattern[] = { PLT_OPCODES };
 static bool valid_hash = false;
 static bool valid_gnu_hash = false;
 static bool verbose = false;
 static char *output_file = NULL;
-static int ph_data, ph_text, ph_rodata;
+int ph_data, ph_text, ph_rodata;
 
 static void usage(char *prg)
 {
@@ -276,37 +158,6 @@ static int get_strtbl_idx(struct string_table *tbl, unsigned int len, int sid)
         idx += tbl[i].len + 1;
     }
     return -1;
-}
-
-static elf_addr get_plt_addr(struct elf *elf, int word_size)
-{
-    if (word_size == 64) {
-        for (elf_addr i = elf->shdr[SH_INIT].sh_offset; i < elf->phdr[ph_text].p_offset +
-                 elf->phdr[ph_text].p_filesz - 16; i++) {
-            if (memcmp(&elf->buf[i], &plt_pattern[0], 2) == 0 &&
-                memcmp(&elf->buf[i + 6], &plt_pattern[6], 2) == 0 &&
-                memcmp(&elf->buf[i + 12], &plt_pattern[12], 3) == 0)
-                return elf->ehdr->e_type == ET_EXEC ? i + elf->base : i;
-        }
-    } else if (word_size == 32) {
-        for (elf_addr i = elf->shdr[SH_INIT].sh_offset; i < elf->phdr[ph_text].p_offset +
-                 elf->phdr[ph_text].p_filesz - 12; i++) {
-            if (memcmp(&elf->buf[i], &plt_pattern[0], 3) == 0 &&
-                memcmp(&elf->buf[i + 6], &plt_pattern[6], 3) == 0)
-                return elf->ehdr->e_type == ET_EXEC ? i + elf->base : i;
-        }
-    }
-    return -1;
-}
-
-/* get the address of the .got section */
-static elf_addr get_got_addr(struct elf *elf)
-{
-    for (int i = 0; i < GOT_NELEMS(elf); i++) {
-        if (ELF_ST_TYPE(get_rel(elf, dyn, info, i)) == R_GLOB_DAT)
-            return get_rel(elf, dyn, offset, i);
-    }
-    return 0;
 }
 
 static int get_nsymbols(struct elf *elf)
@@ -525,7 +376,7 @@ static void update_plt_section(struct elf *elf, elf_addr addr)
     elf->shdr[SH_PLT].sh_info = 0;
     elf->shdr[SH_PLT].sh_addralign = 16;
     elf->shdr[SH_PLT].sh_entsize = PLTENTSZ;
-    elf->shdr[SH_PLT].sh_size = PLTENTSZ * GOTPLT_NELEMS(elf) + sizeof(plt_pattern);
+    elf->shdr[SH_PLT].sh_size = PLTENTSZ * GOTPLT_NELEMS(elf) + get_plt0_size();
     section_list_add(elf, SH_PLT);
     elf->shdr[SH_PLT_GOT].sh_name = get_strtbl_idx(shstrtab, ARRAY_SIZE(shstrtab), SH_PLT_GOT);
     elf->shdr[SH_PLT_GOT].sh_type = SHT_PROGBITS;
@@ -553,10 +404,10 @@ static bool patch_got(struct elf *elf)
     elf->shdr[SH_GOT_PLT].sh_size = (GOTPLT_NELEMS(elf) + GOTPLT_NRESERVED_ELEMS) * sizeof(elf_addr);
 
     /* set the offset based on the data offset and the address of the GOT entry */
-    elf->shdr[SH_GOT_PLT].sh_offset = elf->phdr[ph_data].p_offset + get_rel(elf, plt, offset, 0) -
+    elf->shdr[SH_GOT_PLT].sh_offset = elf->phdr[ph_data].p_offset + GET_REL(elf, plt, offset, 0) -
         elf->phdr[ph_data].p_vaddr - GOTPLT_NRESERVED_ELEMS * sizeof(elf_addr);
 
-    if ((plt_addr = get_plt_addr(elf, ELF_WORD_SIZE)) == -1) {
+    if ((plt_addr = get_plt_addr(elf)) == -1) {
         err_msg("Error: Could not find PLT address");
         return false;
     }
@@ -571,28 +422,28 @@ static bool patch_got(struct elf *elf)
 
     /* r_offset contains the virtual address for the specific GOT entries */
     for (int i = 0; i < GOTPLT_NELEMS(elf); i++) {
-        int sym_idx = ELF_R_SYM(get_rel(elf, plt, info, i)); /* symbol table index */
+        int sym_idx = ELF_R_SYM(GET_REL(elf, plt, info, i)); /* symbol table index */
 
         /* 6 is the size of the first instruction in PLT[n] (jmp [ebx + name1@GOT]) */
         plt_entry = plt_addr + (i + 1) * PLTENTSZ + 6;
         got_entry = *((elf_addr *) (elf->buf + elf->phdr[ph_data].p_offset +
-                                    get_rel(elf, plt, offset, i) - elf->phdr[ph_data].p_vaddr));
+                                    GET_REL(elf, plt, offset, i) - elf->phdr[ph_data].p_vaddr));
         UPDATE_ADDRESS(elf, got_entry);
         if (plt_entry != got_entry) {
-            memcpy(elf->buf + elf->phdr[ph_data].p_offset + get_rel(elf, plt, offset, i) -
+            memcpy(elf->buf + elf->phdr[ph_data].p_offset + GET_REL(elf, plt, offset, i) -
                    elf->phdr[ph_data].p_vaddr, &plt_entry, sizeof(elf_addr));
             if (verbose) {
                 printf("[+] Patching got[%d]:\n", i + 3);
                 printf("    " XFMT "\t" XFMT "\t" XFMT "\t%s\n",
-                       get_rel(elf, plt, offset, i), /* address of GOT entry */
-                       get_rel(elf, plt, info, i),   /* symbol table index and type of relocation */
+                       GET_REL(elf, plt, offset, i), /* address of GOT entry */
+                       GET_REL(elf, plt, info, i),   /* symbol table index and type of relocation */
                        *((elf_addr *) (elf->buf + elf->phdr[ph_data].p_offset +
-                                       get_rel(elf, plt, offset, i) - elf->phdr[ph_data].p_vaddr)),
+                                       GET_REL(elf, plt, offset, i) - elf->phdr[ph_data].p_vaddr)),
                        elf->dynstr + elf->sym[sym_idx].st_name); /* name in the string table */
             }
         } else if (elf->ehdr->e_type == ET_DYN) {
             /* update got to the relative address for pies */
-            memcpy(elf->buf + elf->phdr[ph_data].p_offset + get_rel(elf, plt, offset, i) -
+            memcpy(elf->buf + elf->phdr[ph_data].p_offset + GET_REL(elf, plt, offset, i) -
                    elf->phdr[ph_data].p_vaddr, &got_entry, sizeof(elf_addr));
         }
     }
