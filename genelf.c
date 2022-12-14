@@ -717,7 +717,7 @@ static bool parse_elf(struct elf *elf, pid_t pid)
     elf->ehdr = (elf_ehdr *) elf->buf;
     elf->phdr = (elf_phdr *) (elf->buf + elf->ehdr->e_phoff);
     elf->shdr = xcalloc(NUM_SECTIONS, sizeof(*elf->shdr));
-    elf->section_list = calloc(1, sizeof(*elf->section_list));
+    elf->section_list = xcalloc(1, sizeof(*elf->section_list));
     elf->section_list->shdr = &elf->shdr[SH_NULL];
     elf->section_list->id = SH_NULL;
     if (elf->ehdr->e_type != ET_EXEC && elf->ehdr->e_type != ET_DYN) {
