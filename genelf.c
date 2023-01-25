@@ -334,7 +334,7 @@ static bool read_process(struct elf *elf, FILE *fp, char *name, pid_t pid)
     return true;
 }
 
-char *get_procname(pid_t pid)
+static char *get_procname(pid_t pid)
 {
     char cmdline[PATH_MAX];
     char buf[BUFSIZE];
@@ -956,9 +956,8 @@ int main(int argc, char **argv)
     while ((opt = getopt(argc, argv, "p:r:hv")) != -1) {
         switch (opt) {
         case 'p':
-            if (strlen(optarg) > 10) {
+            if (strlen(optarg) > 10)
                 err_quit("Invalid process id: %s", optarg);
-            }
             pid = atoi(optarg);
             break;
         case 'r':
@@ -970,14 +969,14 @@ int main(int argc, char **argv)
         case 'h':
         default:
             usage(argv[0]);
-            exit(0);
+            exit(EXIT_SUCCESS);
         }
     }
     if (argc > optind)
         output_file = argv[optind];
     if (pid == 0 && !core) {
         usage(argv[0]);
-        exit(0);
+        exit(EXIT_FAILURE);
     }
     memset(&elf, 0, sizeof(elf));
     if (pid != 0) {
@@ -1011,12 +1010,10 @@ int main(int argc, char **argv)
 
         if (!output_file)
             output_file = DEFAULT_FILE;
-        if ((fd = open(core, O_RDONLY)) == -1) {
+        if ((fd = open(core, O_RDONLY)) == -1)
             err_sys("open error");
-        }
-        if (fstat(fd, &st) == -1) {
+        if (fstat(fd, &st) == -1)
             err_sys("fstat error");
-        }
         if ((buf = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0)) == MAP_FAILED)
             err_sys("mmap error");
         close(fd);
@@ -1027,6 +1024,8 @@ int main(int argc, char **argv)
     write_file(&elf);
 
 done:
+    if (pid)
+        ptrace(PTRACE_DETACH, pid, NULL, NULL);
     if (procname)
         free(procname);
     if (elf.buf)
