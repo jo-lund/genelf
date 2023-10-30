@@ -28,11 +28,11 @@
 #define UPDATE_ADDRESS(elf, addr)               \
     do {                                        \
         if ((elf)->ehdr->e_type == ET_DYN)      \
-            (addr) -= (elf->base);              \
+            (addr) -= ((elf)->base);            \
     } while (0)
 
 #define ALIGN(a, b) (((a) + ((b) - 1)) & (-b))
-#define IS_POWEROF2(x) ((x) > 0 && ((x) & (x - 1)) == 0)
+#define IS_POWEROF2(x) ((x) > 0 && ((x) & ((x) - 1)) == 0)
 #define GOTPLT_NELEMS(elf) \
     ((elf)->relplt_type == DT_RELA ? \
      ((elf)->shdr[SH_RELA_PLT].sh_size / sizeof(elf_rela)) : \
@@ -710,6 +710,35 @@ static void read_dynamic_segment(struct elf *elf)
     }
 }
 
+static bool elf_type_supported(int type)
+{
+    switch (type) {
+    case ET_EXEC:
+    case ET_DYN:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static char *get_elf_type(int type)
+{
+    switch (type) {
+    case ET_NONE:
+        return "No file type";
+    case ET_REL:
+        return "Relocatable file";
+    case ET_EXEC:
+        return "Executable file" ;
+    case ET_DYN:
+        return "Shared object file";
+    case ET_CORE:
+        return "Core file";
+    default:
+        return "Unknown";
+    }
+}
+
 static bool parse_elf(struct elf *elf, pid_t pid)
 {
     int nsym;
@@ -720,8 +749,8 @@ static bool parse_elf(struct elf *elf, pid_t pid)
     elf->section_list = xcalloc(1, sizeof(*elf->section_list));
     elf->section_list->shdr = &elf->shdr[SH_NULL];
     elf->section_list->id = SH_NULL;
-    if (elf->ehdr->e_type != ET_EXEC && elf->ehdr->e_type != ET_DYN) {
-        err_msg("ELF type not supported: %d", elf->ehdr->e_type);
+    if (!elf_type_supported(elf->ehdr->e_type)) {
+        err_msg("ELF type not supported: %s (%d)", get_elf_type(elf->ehdr->e_type), elf->ehdr->e_type);
         return false;
     }
     for (int i = 0; i < elf->ehdr->e_phnum; i++) {
@@ -1005,7 +1034,6 @@ int main(int argc, char **argv)
         fclose(fp);
     } else if (core) {
         int fd;
-        unsigned char *buf;
         struct stat st;
 
         if (!output_file)
@@ -1014,21 +1042,19 @@ int main(int argc, char **argv)
             err_sys("open error");
         if (fstat(fd, &st) == -1)
             err_sys("fstat error");
-        if ((buf = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0)) == MAP_FAILED)
+        if ((elf.buf = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0)) == MAP_FAILED)
             err_sys("mmap error");
         close(fd);
     }
-    if (!parse_elf(&elf, pid))
-        goto done;
-    generate_sht(&elf);
-    write_file(&elf);
-
-done:
+    if (parse_elf(&elf, pid)) {
+        generate_sht(&elf);
+        write_file(&elf);
+    }
     if (pid)
         ptrace(PTRACE_DETACH, pid, NULL, NULL);
     if (procname)
         free(procname);
-    if (elf.buf)
+    if (pid && elf.buf)
         free(elf.buf);
     if (elf.sections.buf)
         free(elf.sections.buf);
